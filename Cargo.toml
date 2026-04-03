@@ -1,0 +1,47 @@
+[package]
+name = "cashr"
+version = "0.1.0"
+edition = "2021"
+description = "cashr -- Bitcoin Cash wallet CLI"
+
+[[bin]]
+name = "cashr"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+owo-colors = "4"
+inquire = "0.7"
+qrcode = "0.14"
+
+# Async + HTTP
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+bip39 = "2"
+bip32 = { version = "0.5", features = ["secp256k1"] }
+secp256k1 = { version = "0.29", features = ["global-context"] }
+sha2 = "0.10"
+ripemd = "0.1"
+bs58 = { version = "0.5", features = ["check"] }
+cashaddr = "0.2"
+base64 = "0.22"
+hex = "0.4"
+getrandom = "0.2"
+
+# Filesystem + OS
+dirs = "6"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

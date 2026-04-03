@@ -1,0 +1,220 @@
+{
+  "_comment": "Test vectors generated from paytaca-cli JS codebase for Rust port cross-verification",
+  "_generated": "2026-04-02T15:06:17.816Z",
+  "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+  "derivation_path": "m/44'/145'/0'",
+  "wallet_hash": "89005387c3e19649501ce8be1b2768ef9951922e77f4732775238c5d528a41a2",
+  "mainnet": {
+    "receiving": [
+      {
+        "index": 0,
+        "address": "bitcoincash:qqyx49mu0kkn9ftfj6hje6g2wfer34yfnq5tahq3q6"
+      },
+      {
+        "index": 1,
+        "address": "bitcoincash:qp8sfdhgjlq68hlzka9lcsxtcnvuvnd0xqxugfzzc5"
+      },
+      {
+        "index": 2,
+        "address": "bitcoincash:qqkuy34ntrye9a2h4xpdstcu4aq5wfrwscjtaphenr"
+      },
+      {
+        "index": 3,
+        "address": "bitcoincash:qzcyvxr0e23d408u62ulf6cnspc0k4dyduy8kh77nc"
+      },
+      {
+        "index": 4,
+        "address": "bitcoincash:qptzx8m39zjuuyvrf86s3kywuledfht2jcty8we6gv"
+      }
+    ],
+    "change": [
+      {
+        "index": 0,
+        "address": "bitcoincash:qr8aeharupyrmhfu0d4tdmsnc5y8cfk47y6qrsjsrx"
+      },
+      {
+        "index": 1,
+        "address": "bitcoincash:qr88m3rp5nd5aerz5rh9lzly9u5pevykagwscmjk0c"
+      },
+      {
+        "index": 2,
+        "address": "bitcoincash:qp57cex47jtyhedphe2c63gpzsx3zs0ryvejxly47d"
+      },
+      {
+        "index": 3,
+        "address": "bitcoincash:qrkc2w054n54wg66hhuu8sgzhel0wsrce5k052qnjw"
+      },
+      {
+        "index": 4,
+        "address": "bitcoincash:qpmlhxnersk03qfvlaehxxvcz7yn5p4lssraej9qrc"
+      }
+    ]
+  },
+  "chipnet": {
+    "receiving": [
+      {
+        "index": 0,
+        "address": "bchtest:qqyx49mu0kkn9ftfj6hje6g2wfer34yfnqseeszx8x"
+      },
+      {
+        "index": 1,
+        "address": "bchtest:qp8sfdhgjlq68hlzka9lcsxtcnvuvnd0xqzwvwq4lg"
+      },
+      {
+        "index": 2,
+        "address": "bchtest:qqkuy34ntrye9a2h4xpdstcu4aq5wfrwsckeex4w5l"
+      },
+      {
+        "index": 3,
+        "address": "bchtest:qzcyvxr0e23d408u62ulf6cnspc0k4dyduq4jsuf5y"
+      },
+      {
+        "index": 4,
+        "address": "bchtest:qptzx8m39zjuuyvrf86s3kywuledfht2jc0krfmd0s"
+      }
+    ],
+    "change": [
+      {
+        "index": 0,
+        "address": "bchtest:qr8aeharupyrmhfu0d4tdmsnc5y8cfk47y7j8hs8y6"
+      },
+      {
+        "index": 1,
+        "address": "bchtest:qr88m3rp5nd5aerz5rh9lzly9u5pevykag2zuuspgy"
+      },
+      {
+        "index": 2,
+        "address": "bchtest:qp57cex47jtyhedphe2c63gpzsx3zs0ryvaqzcxze3"
+      },
+      {
+        "index": 3,
+        "address": "bchtest:qrkc2w054n54wg66hhuu8sgzhel0wsrce5jasdzy4j"
+      },
+      {
+        "index": 4,
+        "address": "bchtest:qpmlhxnersk03qfvlaehxxvcz7yn5p4lss80a48hyy"
+      }
+    ]
+  },
+  "token_mainnet": {
+    "receiving": [
+      {
+        "index": 0,
+        "address": "bitcoincash:zqyx49mu0kkn9ftfj6hje6g2wfer34yfnqnpwfwhlf"
+      },
+      {
+        "index": 1,
+        "address": "bitcoincash:zp8sfdhgjlq68hlzka9lcsxtcnvuvnd0xqpkmhvy88"
+      },
+      {
+        "index": 2,
+        "address": "bitcoincash:zqkuy34ntrye9a2h4xpdstcu4aq5wfrwsc4pwlelvs"
+      },
+      {
+        "index": 3,
+        "address": "bitcoincash:zzcyvxr0e23d408u62ulf6cnspc0k4dydurd9fscvt"
+      },
+      {
+        "index": 4,
+        "address": "bitcoincash:zptzx8m39zjuuyvrf86s3kywuledfht2jcvw5shuhl"
+      }
+    ],
+    "change": [
+      {
+        "index": 0,
+        "address": "bitcoincash:zr8aeharupyrmhfu0d4tdmsnc5y8cfk47ya2swuku4"
+      },
+      {
+        "index": 1,
+        "address": "bitcoincash:zr88m3rp5nd5aerz5rh9lzly9u5pevykagf6t9usst"
+      },
+      {
+        "index": 2,
+        "address": "bitcoincash:zp57cex47jtyhedphe2c63gpzsx3zs0ryv7c4p2np7"
+      },
+      {
+        "index": 3,
+        "address": "bitcoincash:zrkc2w054n54wg66hhuu8sgzhel0wsrce53985w4da"
+      },
+      {
+        "index": 4,
+        "address": "bitcoincash:zpmlhxnersk03qfvlaehxxvcz7yn5p4lssyh2vtxut"
+      }
+    ]
+  },
+  "token_chipnet": {
+    "receiving": [
+      {
+        "index": 0,
+        "address": "bchtest:zqyx49mu0kkn9ftfj6hje6g2wfer34yfnqhn2wvqc4"
+      },
+      {
+        "index": 1,
+        "address": "bchtest:zp8sfdhgjlq68hlzka9lcsxtcnvuvnd0xq9ylswnqm"
+      },
+      {
+        "index": 2,
+        "address": "bchtest:zqkuy34ntrye9a2h4xpdstcu4aq5wfrwsc3n2cmgtv"
+      },
+      {
+        "index": 3,
+        "address": "bchtest:zzcyvxr0e23d408u62ulf6cnspc0k4dydu8lpwj0th"
+      },
+      {
+        "index": 4,
+        "address": "bchtest:zptzx8m39zjuuyvrf86s3kywuledfht2jcgush4tsr"
+      }
+    ],
+    "change": [
+      {
+        "index": 0,
+        "address": "bchtest:zr8aeharupyrmhfu0d4tdmsnc5y8cfk47yec5f7pmf"
+      },
+      {
+        "index": 1,
+        "address": "bchtest:zr88m3rp5nd5aerz5rh9lzly9u5pevykagdg0z78hh"
+      },
+      {
+        "index": 2,
+        "address": "bchtest:zp57cex47jtyhedphe2c63gpzsx3zs0ryv623xgyxz"
+      },
+      {
+        "index": 3,
+        "address": "bchtest:zrkc2w054n54wg66hhuu8sgzhel0wsrce54hrnvz2p"
+      },
+      {
+        "index": 4,
+        "address": "bchtest:zpmlhxnersk03qfvlaehxxvcz7yn5p4lssq9wtf3mh"
+      }
+    ]
+  },
+  "public_keys": [
+    {
+      "path": "0/0",
+      "pubkey": "02bbe7dbcdf8b2261530a867df7180b17a90b482f74f2736b8a30d3f756e42e217"
+    },
+    {
+      "path": "0/1",
+      "pubkey": "0262f8bf1ab1d25111c569da0133c30f8b3fa411e2f8af2565d3f0111cb34ae7f6"
+    },
+    {
+      "path": "0/2",
+      "pubkey": "03e3ec1540bc6f7731d99cbb02448c1fa323c29aaa258b9fde5f4f339f2f975547"
+    },
+    {
+      "path": "0/3",
+      "pubkey": "0281a5613b0c8a9870d0bc281eb4dfb688028b8e562bc71a9a612994c85bdc2755"
+    },
+    {
+      "path": "0/4",
+      "pubkey": "029c75f034981dcb99bc1b5fb2e1a001f83d37ec21fd5a1006cada901b2133b196"
+    }
+  ],
+  "signing": {
+    "private_key_hex": "28e9c4f61f735a059af93e0d9aca0b640126c827975841ad83723ccef295e659",
+    "wif": "KxbEv3FeYig2afQp7QEA9R3gwqdTBFwAJJ6Ma7j1SkmZoxC9bAXZ",
+    "path": "0/0",
+    "message": "test message",
+    "signature_base64": "MEQCIA0VgaenNNbf3BVrt5rHd901hh0+dxPKTqhzaAMw4+ykAiBFDwVsSvYWVjsiIVeUI1OjNZQWyMkdGFNGEcGHKvJwkA=="
+  }
+}
