@@ -124,7 +124,9 @@ pub async fn info(wallet_name: Option<&str>, chipnet: bool) -> Result<()> {
     );
 
     let addr_set = bch.get_address_set_at(0)?;
+    let token_addr_set = bch.get_token_address_set_at(0)?;
     println!("   Address:      {}", addr_set.receiving);
+    println!("   Token addr:   {}", token_addr_set.receiving);
 
     // Fetch balance
     match bch.get_balance().await {

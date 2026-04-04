@@ -9,11 +9,17 @@ pub struct ProjectId {
     pub chipnet: String,
 }
 
-/// Read Watchtower project IDs from environment.
+/// Default Paytaca project IDs on Watchtower (public, from watchtower.cash/api/projects/).
+const DEFAULT_MAINNET_PROJECT_ID: &str = "5348e8fd-c001-47c7-b97c-807f545cf44e";
+const DEFAULT_CHIPNET_PROJECT_ID: &str = "5348e8fd-c001-47c7-b97c-807f545cf44e";
+
+/// Read Watchtower project IDs from environment, falling back to Paytaca defaults.
 pub fn project_id() -> ProjectId {
     ProjectId {
-        mainnet: std::env::var("WATCHTOWER_PROJECT_ID").unwrap_or_default(),
-        chipnet: std::env::var("WATCHTOWER_CHIP_PROJECT_ID").unwrap_or_default(),
+        mainnet: std::env::var("WATCHTOWER_PROJECT_ID")
+            .unwrap_or_else(|_| DEFAULT_MAINNET_PROJECT_ID.to_string()),
+        chipnet: std::env::var("WATCHTOWER_CHIP_PROJECT_ID")
+            .unwrap_or_else(|_| DEFAULT_CHIPNET_PROJECT_ID.to_string()),
     }
 }
 

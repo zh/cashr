@@ -17,6 +17,9 @@ pub struct Utxo {
     pub vout: u32,
     pub value: u64,          // satoshis
     pub address_path: String, // e.g. "0/0" or "1/3"
+    /// Token data of this UTXO (if it's a CashToken UTXO).
+    /// Required for correct sighash computation when spending token UTXOs.
+    pub token: Option<TokenPrefix>,
 }
 
 /// A transaction output (recipient).
@@ -34,6 +37,51 @@ pub struct BuiltTransaction {
     pub fee: u64,     // fee in satoshis
 }
 
+// ── CashToken types ────────────────────────────────────────────────
+
+/// CashToken NFT capability.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NftCapability {
+    None = 0,      // immutable
+    Mutable = 1,
+    Minting = 2,
+}
+
+impl NftCapability {
+    /// Parse from string representation.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "none" => Ok(Self::None),
+            "mutable" => Ok(Self::Mutable),
+            "minting" => Ok(Self::Minting),
+            _ => bail!("unknown NFT capability: {}", s),
+        }
+    }
+}
+
+/// NFT data within a CashToken prefix.
+#[derive(Debug, Clone)]
+pub struct NftData {
+    pub capability: NftCapability,
+    pub commitment: Vec<u8>,
+}
+
+/// CashToken prefix attached to a transaction output.
+#[derive(Debug, Clone)]
+pub struct TokenPrefix {
+    pub category: [u8; 32],   // 32 bytes, byte-reversed from hex (same as txid)
+    pub nft: Option<NftData>,
+    pub amount: u64,           // fungible token amount (0 if none)
+}
+
+/// A transaction output with optional CashToken data.
+#[derive(Debug, Clone)]
+pub struct TokenTxOutput {
+    pub address: String,
+    pub value: u64,
+    pub token: Option<TokenPrefix>,
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 const SIGHASH_ALL: u32 = 0x01;
@@ -41,6 +89,7 @@ const SIGHASH_FORKID: u32 = 0x40;
 const SIGHASH_ALL_FORKID: u32 = SIGHASH_ALL | SIGHASH_FORKID; // 0x41
 
 const DUST_LIMIT: u64 = 546;
+const TOKEN_DUST: u64 = 800; // minimum BCH on a token output
 const DEFAULT_FEE_RATE: f64 = 1.2; // sats/byte
 
 /// Estimated byte sizes for fee calculation.
@@ -308,6 +357,196 @@ pub fn build_send_all_transaction(
     Ok(BuiltTransaction { hex: hex_str, txid, fee })
 }
 
+// ── CashToken transaction builder ──────────────────────────────────
+
+/// Minimum BCH value for a token output.
+pub const fn token_dust() -> u64 {
+    TOKEN_DUST
+}
+
+/// Build a signed transaction that includes CashToken outputs.
+///
+/// All UTXO selection is done by the caller. This function:
+/// 1. Serializes outputs (prepending token prefix where present)
+/// 2. Calculates fee and adds BCH change if needed
+/// 3. Signs all inputs (P2PKH + SIGHASH_FORKID)
+pub fn build_token_transaction(
+    inputs: &[Utxo],
+    outputs: &[TokenTxOutput],
+    change_address: &str,
+    hd_wallet: &HdWallet,
+    fee_rate: f64,
+) -> Result<BuiltTransaction> {
+    if inputs.is_empty() {
+        bail!("no inputs provided");
+    }
+    if outputs.is_empty() {
+        bail!("no outputs specified");
+    }
+
+    let fee_rate = if fee_rate <= 0.0 { DEFAULT_FEE_RATE } else { fee_rate };
+    let input_total: u64 = inputs.iter().map(|u| u.value).sum();
+    let output_total: u64 = outputs.iter().map(|o| o.value).sum();
+
+    // Build output scripts (with token prefixes where present)
+    let mut output_scripts: Vec<(u64, Vec<u8>)> = Vec::new();
+    for o in outputs {
+        let script = p2pkh_script_from_address(&o.address)
+            .with_context(|| format!("failed to create script for address {}", o.address))?;
+        let full_script = match &o.token {
+            Some(token) => {
+                let mut s = serialize_token_prefix(token);
+                s.extend_from_slice(&script);
+                s
+            }
+            None => script,
+        };
+        output_scripts.push((o.value, full_script));
+    }
+
+    // Compute output sizes for fee estimation
+    let fixed_output_bytes: usize = output_scripts
+        .iter()
+        .map(|(_, script)| 8 + varint_len(script.len() as u64) + script.len())
+        .sum();
+
+    // Estimate fee with change output
+    let size_with_change = OVERHEAD_SIZE + inputs.len() * INPUT_SIZE + fixed_output_bytes + OUTPUT_SIZE;
+    let fee_with_change = (size_with_change as f64 * fee_rate).ceil() as u64;
+
+    // Estimate fee without change output
+    let size_no_change = OVERHEAD_SIZE + inputs.len() * INPUT_SIZE + fixed_output_bytes;
+    let fee_no_change = (size_no_change as f64 * fee_rate).ceil() as u64;
+
+    if input_total < output_total + fee_no_change {
+        let lacking = (output_total + fee_no_change) - input_total;
+        bail!(
+            "insufficient funds: need {} sats, have {} sats (short by {} sats)",
+            output_total + fee_no_change,
+            input_total,
+            lacking
+        );
+    }
+
+    let fee;
+    if input_total >= output_total + fee_with_change + DUST_LIMIT {
+        let change_amount = input_total - output_total - fee_with_change;
+        let change_script = p2pkh_script_from_address(change_address)
+            .context("failed to create change script")?;
+        output_scripts.push((change_amount, change_script));
+        fee = fee_with_change;
+    } else {
+        fee = input_total - output_total;
+    }
+
+    // Build unsigned transaction
+    let mut raw_tx = RawTx {
+        version: 2u32,
+        inputs: Vec::new(),
+        outputs: output_scripts.clone(),
+        locktime: 0u32,
+    };
+
+    for utxo in inputs {
+        let prev_txid = decode_txid_to_bytes(&utxo.txid)?;
+        raw_tx.inputs.push(RawInput {
+            prev_txid,
+            prev_vout: utxo.vout,
+            script_sig: Vec::new(),
+            sequence: 0xffffffff,
+        });
+    }
+
+    let cache = SighashCache {
+        hash_prevouts: compute_hash_prevouts(&raw_tx.inputs),
+        hash_sequence: compute_hash_sequence(&raw_tx.inputs),
+        hash_outputs: compute_hash_outputs(&raw_tx.outputs),
+    };
+
+    let secp = Secp256k1::signing_only();
+
+    for (i, utxo) in inputs.iter().enumerate() {
+        let private_key_bytes = hd_wallet.get_private_key_at(&utxo.address_path)?;
+        let pubkey_hex = hd_wallet.get_pubkey_at(&utxo.address_path)?;
+        let pubkey_bytes = hex::decode(&pubkey_hex).context("invalid pubkey hex")?;
+        let p2pkh_script = p2pkh_script_from_pubkey_bytes(&pubkey_bytes);
+
+        // For token UTXOs, the scriptCode includes the token prefix before the P2PKH script.
+        // CHIP-2022-02: "the full encoded token prefix must be inserted immediately
+        // before the coveredBytecode in the signing serialization."
+        let script_code = match &utxo.token {
+            Some(token) => {
+                let mut sc = serialize_token_prefix(token);
+                sc.extend_from_slice(&p2pkh_script);
+                sc
+            }
+            None => p2pkh_script,
+        };
+
+        let sighash = sighash_forkid(
+            &raw_tx, i, &script_code, utxo.value, SIGHASH_ALL_FORKID, &cache,
+        );
+
+        let secret_key = SecretKey::from_slice(&private_key_bytes).context("invalid private key")?;
+        let message = Message::from_digest(sighash);
+        let signature = secp.sign_ecdsa(&message, &secret_key);
+
+        let der_sig = signature.serialize_der();
+        raw_tx.inputs[i].script_sig = build_script_sig(&der_sig, &pubkey_bytes);
+    }
+
+    let tx_bytes = serialize_tx(&raw_tx);
+    let hex_str = hex::encode(&tx_bytes);
+    let txid_bytes = crypto::sha256d(&tx_bytes);
+    let txid = hex::encode(txid_bytes.iter().rev().copied().collect::<Vec<u8>>());
+
+    Ok(BuiltTransaction { hex: hex_str, txid, fee })
+}
+
+/// Serialize a CashToken prefix to bytes (CHIP-2022-02 format).
+///
+/// Format: 0xef + category(32) + bitfield(1) + [commitment_len + commitment] + [amount]
+fn serialize_token_prefix(token: &TokenPrefix) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.push(0xef); // TOKEN_PREFIX_BYTE
+    buf.extend_from_slice(&token.category); // 32-byte category (byte-reversed)
+
+    let mut bitfield: u8 = 0;
+    if let Some(ref nft) = token.nft {
+        bitfield |= 0x20; // HAS_NFT
+        bitfield |= nft.capability as u8; // capability in lower nibble
+        if !nft.commitment.is_empty() {
+            bitfield |= 0x40; // HAS_COMMITMENT_LENGTH
+        }
+    }
+    if token.amount > 0 {
+        bitfield |= 0x10; // HAS_AMOUNT
+    }
+    buf.push(bitfield);
+
+    // Commitment (if NFT with non-empty commitment)
+    if let Some(ref nft) = token.nft {
+        if !nft.commitment.is_empty() {
+            write_varint(&mut buf, nft.commitment.len() as u64);
+            buf.extend_from_slice(&nft.commitment);
+        }
+    }
+    // Fungible amount
+    if token.amount > 0 {
+        write_varint(&mut buf, token.amount);
+    }
+
+    buf
+}
+
+/// Byte length of a varint encoding.
+fn varint_len(value: u64) -> usize {
+    if value < 0xfd { 1 }
+    else if value <= 0xffff { 3 }
+    else if value <= 0xffff_ffff { 5 }
+    else { 9 }
+}
+
 // ── Internal types ──────────────────────────────────────────────────
 
 struct RawTx {
@@ -490,7 +729,8 @@ fn serialize_tx(tx: &RawTx) -> Vec<u8> {
 // ── Utility functions ───────────────────────────────────────────────
 
 /// Decode a 64-char hex txid to 32 bytes, reversed (internal byte order).
-fn decode_txid_to_bytes(txid_hex: &str) -> Result<[u8; 32]> {
+/// Also used for CashToken category IDs (which are genesis txids).
+pub fn decode_txid_to_bytes(txid_hex: &str) -> Result<[u8; 32]> {
     if txid_hex.len() != 64 {
         bail!("txid must be 64 hex characters, got {}", txid_hex.len());
     }
@@ -877,6 +1117,7 @@ mod tests {
             vout: 0,
             value: 100, // only 100 sats
             address_path: "0/0".to_string(),
+                token: None,
         }];
         let outputs = vec![TxOutput {
             address: TEST_ADDRESS.to_string(),
@@ -899,6 +1140,7 @@ mod tests {
             vout: 0,
             value: 100_000, // 100k sats
             address_path: "0/0".to_string(),
+                token: None,
         }];
 
         let outputs = vec![TxOutput {
@@ -940,6 +1182,7 @@ mod tests {
             vout: 0,
             value: 100_000,
             address_path: "0/0".to_string(),
+                token: None,
         }];
         let result = build_p2pkh_transaction(&utxos, &[], TEST_ADDRESS, &hd, 1.2);
         assert!(result.is_err());
@@ -960,6 +1203,7 @@ mod tests {
             vout: 0,
             value: utxo_value,
             address_path: "0/0".to_string(),
+                token: None,
         }];
         let outputs = vec![TxOutput {
             address: TEST_ADDRESS.to_string(),
@@ -985,18 +1229,21 @@ mod tests {
                 vout: 0,
                 value: 500,
                 address_path: "0/0".to_string(),
+                token: None,
             },
             Utxo {
                 txid: "22".repeat(32),
                 vout: 0,
                 value: 50_000,
                 address_path: "0/0".to_string(),
+                token: None,
             },
             Utxo {
                 txid: "33".repeat(32),
                 vout: 0,
                 value: 1_000,
                 address_path: "0/0".to_string(),
+                token: None,
             },
         ];
 
@@ -1026,5 +1273,222 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pkhash, expected);
+    }
+
+    // ── CashToken prefix tests ─────────────────────────────────────
+
+    #[test]
+    fn test_serialize_token_prefix_fungible_only() {
+        let category = [0xaa; 32];
+        let token = TokenPrefix {
+            category,
+            nft: None,
+            amount: 100,
+        };
+        let bytes = serialize_token_prefix(&token);
+
+        assert_eq!(bytes[0], 0xef); // PREFIX byte
+        assert_eq!(&bytes[1..33], &[0xaa; 32]); // category
+        assert_eq!(bytes[33], 0x10); // bitfield: HAS_AMOUNT only
+        assert_eq!(bytes[34], 100); // amount as varint
+        assert_eq!(bytes.len(), 35);
+    }
+
+    #[test]
+    fn test_serialize_token_prefix_nft_no_commitment() {
+        let category = [0xbb; 32];
+        let token = TokenPrefix {
+            category,
+            nft: Some(NftData {
+                capability: NftCapability::None,
+                commitment: Vec::new(),
+            }),
+            amount: 0,
+        };
+        let bytes = serialize_token_prefix(&token);
+
+        assert_eq!(bytes[0], 0xef);
+        assert_eq!(bytes[33], 0x20); // HAS_NFT, capability=none(0)
+        assert_eq!(bytes.len(), 34); // no commitment, no amount
+    }
+
+    #[test]
+    fn test_serialize_token_prefix_nft_with_commitment() {
+        let category = [0xcc; 32];
+        let token = TokenPrefix {
+            category,
+            nft: Some(NftData {
+                capability: NftCapability::Mutable,
+                commitment: vec![0xff, 0x00],
+            }),
+            amount: 0,
+        };
+        let bytes = serialize_token_prefix(&token);
+
+        assert_eq!(bytes[0], 0xef);
+        assert_eq!(bytes[33], 0x61); // HAS_NFT(0x20) | HAS_COMMITMENT(0x40) | mutable(1)
+        assert_eq!(bytes[34], 2); // commitment length
+        assert_eq!(&bytes[35..37], &[0xff, 0x00]); // commitment
+        assert_eq!(bytes.len(), 37);
+    }
+
+    #[test]
+    fn test_serialize_token_prefix_nft_minting_with_amount() {
+        let category = [0xdd; 32];
+        let token = TokenPrefix {
+            category,
+            nft: Some(NftData {
+                capability: NftCapability::Minting,
+                commitment: vec![0x01],
+            }),
+            amount: 500,
+        };
+        let bytes = serialize_token_prefix(&token);
+
+        assert_eq!(bytes[0], 0xef);
+        // HAS_AMOUNT(0x10) | HAS_NFT(0x20) | HAS_COMMITMENT(0x40) | minting(2)
+        assert_eq!(bytes[33], 0x72);
+        assert_eq!(bytes[34], 1); // commitment length
+        assert_eq!(bytes[35], 0x01); // commitment
+        // amount 500 as varint: 0xfd 0xf4 0x01
+        assert_eq!(bytes[36], 0xfd);
+        assert_eq!(&bytes[37..39], &500u16.to_le_bytes());
+    }
+
+    #[test]
+    fn test_nft_capability_parse() {
+        assert_eq!(NftCapability::parse("none").unwrap(), NftCapability::None);
+        assert_eq!(NftCapability::parse("mutable").unwrap(), NftCapability::Mutable);
+        assert_eq!(NftCapability::parse("minting").unwrap(), NftCapability::Minting);
+        assert!(NftCapability::parse("invalid").is_err());
+    }
+
+    #[test]
+    fn test_varint_len() {
+        assert_eq!(varint_len(0), 1);
+        assert_eq!(varint_len(252), 1);
+        assert_eq!(varint_len(253), 3);
+        assert_eq!(varint_len(0xffff), 3);
+        assert_eq!(varint_len(0x10000), 5);
+    }
+
+    #[test]
+    fn test_build_token_transaction_fungible() {
+        let hd = HdWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let category = decode_txid_to_bytes(&"ab".repeat(32)).unwrap();
+
+        let inputs = vec![
+            // Token UTXO
+            Utxo {
+                txid: "11".repeat(32),
+                vout: 0,
+                value: 800,
+                address_path: "0/0".to_string(),
+                token: None,
+            },
+            // BCH UTXO for fees
+            Utxo {
+                txid: "22".repeat(32),
+                vout: 0,
+                value: 50_000,
+                address_path: "0/0".to_string(),
+                token: None,
+            },
+        ];
+
+        let outputs = vec![TokenTxOutput {
+            address: TEST_ADDRESS.to_string(),
+            value: 800,
+            token: Some(TokenPrefix {
+                category,
+                nft: None,
+                amount: 100,
+            }),
+        }];
+
+        let result = build_token_transaction(&inputs, &outputs, TEST_ADDRESS, &hd, 1.2);
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+
+        let tx = result.unwrap();
+        assert!(!tx.hex.is_empty());
+        assert_eq!(tx.txid.len(), 64);
+        assert!(tx.fee > 0);
+
+        // Verify the hex contains the token prefix byte
+        let tx_bytes = hex::decode(&tx.hex).unwrap();
+        // Version should be 2
+        assert_eq!(&tx_bytes[0..4], &[0x02, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_build_token_transaction_nft() {
+        let hd = HdWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let category = decode_txid_to_bytes(&"cd".repeat(32)).unwrap();
+
+        let inputs = vec![
+            Utxo {
+                txid: "33".repeat(32),
+                vout: 0,
+                value: 800,
+                address_path: "0/0".to_string(),
+                token: None,
+            },
+            Utxo {
+                txid: "44".repeat(32),
+                vout: 1,
+                value: 10_000,
+                address_path: "0/0".to_string(),
+                token: None,
+            },
+        ];
+
+        let outputs = vec![TokenTxOutput {
+            address: TEST_ADDRESS.to_string(),
+            value: 800,
+            token: Some(TokenPrefix {
+                category,
+                nft: Some(NftData {
+                    capability: NftCapability::None,
+                    commitment: vec![0xde, 0xad],
+                }),
+                amount: 0,
+            }),
+        }];
+
+        let result = build_token_transaction(&inputs, &outputs, TEST_ADDRESS, &hd, 1.2);
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+
+        let tx = result.unwrap();
+        assert!(tx.fee > 0);
+        assert!(tx.fee < 1000);
+    }
+
+    #[test]
+    fn test_build_token_transaction_insufficient_funds() {
+        let hd = HdWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let category = [0xaa; 32];
+
+        let inputs = vec![Utxo {
+            txid: "55".repeat(32),
+            vout: 0,
+            value: 100, // not enough
+            address_path: "0/0".to_string(),
+                token: None,
+        }];
+
+        let outputs = vec![TokenTxOutput {
+            address: TEST_ADDRESS.to_string(),
+            value: 800,
+            token: Some(TokenPrefix {
+                category,
+                nft: None,
+                amount: 50,
+            }),
+        }];
+
+        let result = build_token_transaction(&inputs, &outputs, TEST_ADDRESS, &hd, 1.2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("insufficient") || err.contains("short"));
     }
 }

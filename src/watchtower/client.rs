@@ -13,12 +13,16 @@ pub struct WatchtowerClient {
 
 // ── Request/Response types ───────────────────────────────────────────
 
+/// Watchtower subscription request (POST /subscription/).
+/// Registers a single address for monitoring under a wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscribeRequest {
-    pub addresses: AddressSetPayload,
+    pub address: String,
     pub project_id: String,
-    pub wallet_hash: String,
-    pub address_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +141,19 @@ pub struct NftUtxo {
     pub value: f64,
 }
 
+/// A CashToken UTXO with full token data and address path for signing.
+#[derive(Debug, Clone)]
+pub struct CashTokenUtxo {
+    pub txid: String,
+    pub vout: u32,
+    pub value: u64,
+    pub address_path: String,
+    pub token_id: String,
+    pub token_amount: u64,
+    pub commitment: String,
+    pub capability: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendRequest {
     pub sender: SenderInfo,
@@ -227,13 +244,13 @@ struct RawFungibleToken {
     #[serde(default)]
     id: String,
     #[serde(default)]
-    name: String,
+    name: Option<String>,
     #[serde(default)]
-    symbol: String,
+    symbol: Option<String>,
     #[serde(default)]
     decimals: u32,
     #[serde(default)]
-    image_url: String,
+    image_url: Option<String>,
     #[serde(default)]
     balance: f64,
 }
@@ -244,27 +261,75 @@ struct RawUtxoResponse {
     utxos: Vec<RawUtxo>,
 }
 
+/// Deserialize a value that may be a number or a string containing a number.
+fn deserialize_f64_or_string<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct F64OrString;
+    impl<'de> de::Visitor<'de> for F64OrString {
+        type Value = f64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a number or numeric string")
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<f64, E> { Ok(v) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<f64, E> { Ok(v as f64) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<f64, E> { Ok(v as f64) }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<f64, E> {
+            v.parse::<f64>().map_err(de::Error::custom)
+        }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<f64, E> { Ok(0.0) }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<f64, E> { Ok(0.0) }
+    }
+    deserializer.deserialize_any(F64OrString)
+}
+
+/// Deserialize a value that may be a string, integer, or null into Option<String>.
+fn deserialize_optional_string<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct OptString;
+    impl<'de> de::Visitor<'de> for OptString {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string, integer, or null")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Option<String>, E> { Ok(Some(v.to_string())) }
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Option<String>, E> { Ok(Some(v)) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Option<String>, E> { Ok(Some(v.to_string())) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Option<String>, E> { Ok(Some(v.to_string())) }
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Option<String>, E> { Ok(None) }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Option<String>, E> { Ok(None) }
+    }
+    deserializer.deserialize_any(OptString)
+}
+
 #[derive(Debug, Deserialize)]
 struct RawUtxo {
     #[serde(default)]
     txid: String,
     #[serde(default)]
     vout: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     tokenid: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     commitment: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     capability: Option<String>,
     #[serde(default)]
     is_cashtoken: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_f64_or_string")]
     amount: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_f64_or_string")]
     value: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     address_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     wallet_index: Option<String>,
 }
 
@@ -325,7 +390,7 @@ impl WatchtowerClient {
     pub async fn subscribe(&self, data: &SubscribeRequest) -> Result<SubscribeResponse> {
         let resp = self
             .client
-            .post(self.url("subscribe/"))
+            .post(self.url("subscription/"))
             .json(data)
             .send()
             .await
@@ -474,17 +539,14 @@ impl WatchtowerClient {
 
             for raw in page.results {
                 let category = extract_category(&raw.id);
+                let name = raw.name.unwrap_or_default();
                 all_tokens.push(FungibleToken {
                     id: raw.id.clone(),
                     category,
-                    name: if raw.name.is_empty() {
-                        "Unknown Token".to_string()
-                    } else {
-                        raw.name
-                    },
-                    symbol: raw.symbol,
+                    name: if name.is_empty() { "Unknown Token".to_string() } else { name },
+                    symbol: raw.symbol.unwrap_or_default(),
                     decimals: raw.decimals,
-                    image_url: raw.image_url,
+                    image_url: raw.image_url.unwrap_or_default(),
                     balance: raw.balance,
                 });
             }
@@ -520,21 +582,14 @@ impl WatchtowerClient {
             .context("failed to parse token info response")?;
 
         let cat = extract_category(&raw.id);
+        let name = raw.name.unwrap_or_default();
         Ok(Some(FungibleToken {
             id: raw.id.clone(),
-            category: if cat.is_empty() {
-                category.to_string()
-            } else {
-                cat
-            },
-            name: if raw.name.is_empty() {
-                "Unknown Token".to_string()
-            } else {
-                raw.name
-            },
-            symbol: raw.symbol,
+            category: if cat.is_empty() { category.to_string() } else { cat },
+            name: if name.is_empty() { "Unknown Token".to_string() } else { name },
+            symbol: raw.symbol.unwrap_or_default(),
             decimals: raw.decimals,
-            image_url: raw.image_url,
+            image_url: raw.image_url.unwrap_or_default(),
             balance: raw.balance,
         }))
     }
@@ -587,6 +642,54 @@ impl WatchtowerClient {
         Ok(nfts)
     }
 
+    /// Get CashToken UTXOs for a wallet, filtered by category.
+    /// Returns UTXOs with full token data and address path for signing.
+    pub async fn get_cashtoken_utxos(
+        &self,
+        wallet_hash: &str,
+        category: &str,
+    ) -> Result<Vec<CashTokenUtxo>> {
+        let resp = self
+            .client
+            .get(self.url(&format!("utxo/wallet/{}/", wallet_hash)))
+            .query(&[("is_cashtoken", "true")])
+            .send()
+            .await
+            .context("CashToken UTXO request failed")?;
+
+        let data: RawUtxoResponse = resp
+            .json()
+            .await
+            .context("failed to parse UTXO response")?;
+
+        let mut utxos = Vec::new();
+        for raw in data.utxos {
+            if !raw.is_cashtoken {
+                continue;
+            }
+            if raw.tokenid.as_deref() != Some(category) {
+                continue;
+            }
+            let address_path = raw
+                .address_path
+                .or(raw.wallet_index)
+                .unwrap_or_else(|| "0/0".to_string());
+
+            utxos.push(CashTokenUtxo {
+                txid: raw.txid,
+                vout: raw.vout,
+                value: raw.value as u64,
+                address_path,
+                token_id: raw.tokenid.unwrap_or_default(),
+                token_amount: raw.amount as u64,
+                commitment: raw.commitment.unwrap_or_default(),
+                capability: raw.capability,
+            });
+        }
+
+        Ok(utxos)
+    }
+
     /// Get BCH (non-token) UTXOs for a wallet, suitable for spending.
     pub async fn get_bch_utxos(&self, wallet_hash: &str) -> Result<Vec<Utxo>> {
         let resp = self
@@ -623,6 +726,7 @@ impl WatchtowerClient {
                 vout: raw.vout,
                 value,
                 address_path,
+                token: None,
             });
         }
 
@@ -642,23 +746,39 @@ impl WatchtowerClient {
             .context("broadcast request failed")?;
 
         let status = resp.status();
-        if status.is_success() {
-            let raw: RawBroadcastResponse = resp
-                .json()
-                .await
-                .context("failed to parse broadcast response")?;
-            Ok(BroadcastResult {
-                txid: raw.txid,
-                success: true,
-                error: None,
-            })
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Ok(BroadcastResult {
+        let body = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Ok(BroadcastResult {
                 txid: None,
                 success: false,
                 error: Some(format!("broadcast failed ({}): {}", status, body)),
-            })
+            });
+        }
+
+        // Parse response — watchtower may return {"txid":"..."} or an error in 200
+        match serde_json::from_str::<RawBroadcastResponse>(&body) {
+            Ok(raw) if raw.txid.is_some() => Ok(BroadcastResult {
+                txid: raw.txid,
+                success: true,
+                error: None,
+            }),
+            _ => {
+                // 200 but no txid — likely an error disguised as success
+                if body.contains("error") || body.contains("Error") || body.contains("reject") {
+                    Ok(BroadcastResult {
+                        txid: None,
+                        success: false,
+                        error: Some(format!("broadcast rejected: {}", body)),
+                    })
+                } else {
+                    Ok(BroadcastResult {
+                        txid: None,
+                        success: false,
+                        error: Some(format!("broadcast returned no txid: {}", body)),
+                    })
+                }
+            }
         }
     }
 

@@ -1,12 +1,12 @@
 /// BchWallet: business logic combining HdWallet + WatchtowerClient.
 ///
 /// Provides all BCH wallet operations: balance, send, tokens, history.
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::transaction;
 use crate::watchtower::client::{
-    AddressScanEntry, AddressScanRequest, AddressSetPayload, BalanceResponse, FungibleToken,
-    HistoryParams, HistoryResponse, NftUtxo, SendResult, SubscribeRequest, WatchtowerClient,
+    BalanceResponse, CashTokenUtxo, FungibleToken, HistoryParams, HistoryResponse, NftUtxo,
+    SendResult, SubscribeRequest, WatchtowerClient,
 };
 
 use super::keys::{AddressSet, HdWallet};
@@ -79,17 +79,27 @@ impl BchWallet {
     /// Subscribe a new address set with Watchtower for monitoring.
     pub async fn get_new_address_set(&self, index: u32) -> Result<Option<AddressSet>> {
         let addresses = self.hd_wallet.get_address_set_at(index)?;
-        let data = SubscribeRequest {
-            addresses: AddressSetPayload {
-                receiving: addresses.receiving.clone(),
-                change: addresses.change.clone(),
-            },
-            project_id: self.project_id.clone(),
-            wallet_hash: self.wallet_hash.clone(),
-            address_index: index,
-        };
-        let result = self.watchtower.subscribe(&data).await?;
-        if result.success {
+        // Subscribe receiving address
+        let recv_result = self
+            .watchtower
+            .subscribe(&SubscribeRequest {
+                address: addresses.receiving.clone(),
+                project_id: self.project_id.clone(),
+                wallet_hash: Some(self.wallet_hash.clone()),
+                wallet_index: Some(index),
+            })
+            .await?;
+        // Subscribe change address
+        let _ = self
+            .watchtower
+            .subscribe(&SubscribeRequest {
+                address: addresses.change.clone(),
+                project_id: self.project_id.clone(),
+                wallet_hash: Some(self.wallet_hash.clone()),
+                wallet_index: Some(index),
+            })
+            .await;
+        if recv_result.success {
             Ok(Some(addresses))
         } else {
             Ok(None)
@@ -134,26 +144,54 @@ impl BchWallet {
             .await
     }
 
-    /// Bulk-subscribe addresses to Watchtower.
+    /// Subscribe a range of addresses to Watchtower for monitoring.
+    /// Registers both regular (q-prefix) and token-aware (z-prefix) addresses.
     pub async fn scan_addresses(&self, start_index: u32, count: u32) -> Result<()> {
         let end_index = start_index + count;
-        let mut address_sets = Vec::new();
         for i in start_index..end_index {
+            // Regular addresses (q-prefix)
             let addrs = self.hd_wallet.get_address_set_at(i)?;
-            address_sets.push(AddressScanEntry {
-                address_index: i,
-                addresses: AddressSetPayload {
-                    receiving: addrs.receiving,
-                    change: addrs.change,
-                },
-            });
+            let _ = self
+                .watchtower
+                .subscribe(&SubscribeRequest {
+                    address: addrs.receiving,
+                    project_id: self.project_id.clone(),
+                    wallet_hash: Some(self.wallet_hash.clone()),
+                    wallet_index: Some(i),
+                })
+                .await;
+            let _ = self
+                .watchtower
+                .subscribe(&SubscribeRequest {
+                    address: addrs.change,
+                    project_id: self.project_id.clone(),
+                    wallet_hash: Some(self.wallet_hash.clone()),
+                    wallet_index: Some(i),
+                })
+                .await;
+
+            // Token-aware addresses (z-prefix)
+            let token_addrs = self.hd_wallet.get_token_address_set_at(i)?;
+            let _ = self
+                .watchtower
+                .subscribe(&SubscribeRequest {
+                    address: token_addrs.receiving,
+                    project_id: self.project_id.clone(),
+                    wallet_hash: Some(self.wallet_hash.clone()),
+                    wallet_index: Some(i),
+                })
+                .await;
+            let _ = self
+                .watchtower
+                .subscribe(&SubscribeRequest {
+                    address: token_addrs.change,
+                    project_id: self.project_id.clone(),
+                    wallet_hash: Some(self.wallet_hash.clone()),
+                    wallet_index: Some(i),
+                })
+                .await;
         }
-        let data = AddressScanRequest {
-            address_sets,
-            wallet_hash: self.wallet_hash.clone(),
-            project_id: self.project_id.clone(),
-        };
-        self.watchtower.scan_addresses(&data).await
+        Ok(())
     }
 
     /// Trigger a UTXO scan.
@@ -278,19 +316,323 @@ impl BchWallet {
     }
 
     /// Send fungible CashTokens.
+    ///
+    /// 1. Fetches token UTXOs for the category
+    /// 2. Selects enough to cover the send amount
+    /// 3. Fetches BCH UTXOs for fees
+    /// 4. Builds, signs, and broadcasts the transaction locally
     pub async fn send_token(
         &self,
-        _category: &str,
-        _amount: u64,
-        _address: &str,
-        _change_address: Option<&str>,
+        category: &str,
+        amount: u64,
+        address: &str,
+        change_address: Option<&str>,
     ) -> Result<SendResult> {
-        todo!("CashToken sends require token-aware outputs -- not yet implemented")
+        let token_change_addr = match change_address {
+            Some(addr) => addr.to_string(),
+            None => self.hd_wallet.get_token_address_set_at(0)?.change,
+        };
+        let bch_change_addr = self.hd_wallet.get_address_set_at(0)?.change;
+
+        // Fetch token UTXOs for this category
+        let token_utxos = self
+            .watchtower
+            .get_cashtoken_utxos(&self.wallet_hash, category)
+            .await
+            .context("failed to fetch token UTXOs")?;
+
+        // Select fungible token UTXOs (no NFT capability)
+        let fungible_utxos: Vec<_> = token_utxos
+            .iter()
+            .filter(|u| u.capability.is_none())
+            .collect();
+
+        if fungible_utxos.is_empty() {
+            return Ok(SendResult {
+                success: false,
+                txid: None,
+                error: Some("no fungible token UTXOs found for this category".to_string()),
+                lacking_sats: None,
+            });
+        }
+
+        // Accumulate until we have enough tokens
+        let mut selected: Vec<&CashTokenUtxo> = Vec::new();
+        let mut token_total: u64 = 0;
+        for utxo in &fungible_utxos {
+            selected.push(utxo);
+            token_total += utxo.token_amount;
+            if token_total >= amount {
+                break;
+            }
+        }
+
+        if token_total < amount {
+            return Ok(SendResult {
+                success: false,
+                txid: None,
+                error: Some(format!(
+                    "insufficient token balance: have {}, need {}",
+                    token_total, amount
+                )),
+                lacking_sats: None,
+            });
+        }
+
+        // Build token outputs
+        let category_bytes = transaction::decode_txid_to_bytes(category)
+            .context("invalid category hex")?;
+
+        let mut outputs = vec![transaction::TokenTxOutput {
+            address: address.to_string(),
+            value: transaction::token_dust(),
+            token: Some(transaction::TokenPrefix {
+                category: category_bytes,
+                nft: None,
+                amount,
+            }),
+        }];
+
+        // Token change output (if we selected more tokens than needed)
+        let token_change = token_total - amount;
+        if token_change > 0 {
+            outputs.push(transaction::TokenTxOutput {
+                address: token_change_addr,
+                value: transaction::token_dust(),
+                token: Some(transaction::TokenPrefix {
+                    category: category_bytes,
+                    nft: None,
+                    amount: token_change,
+                }),
+            });
+        }
+
+        // Convert selected token UTXOs to transaction inputs (with token data for sighash)
+        let mut all_inputs: Vec<transaction::Utxo> = selected
+            .iter()
+            .map(|u| transaction::Utxo {
+                txid: u.txid.clone(),
+                vout: u.vout,
+                value: u.value,
+                address_path: u.address_path.clone(),
+                token: Some(transaction::TokenPrefix {
+                    category: category_bytes,
+                    nft: None,
+                    amount: u.token_amount,
+                }),
+            })
+            .collect();
+
+        // Fetch BCH UTXOs for fees
+        let bch_utxos = self
+            .watchtower
+            .get_bch_utxos(&self.wallet_hash)
+            .await
+            .context("failed to fetch BCH UTXOs")?;
+
+        let mut sorted_bch = bch_utxos.clone();
+        sorted_bch.sort_by(|a, b| b.value.cmp(&a.value));
+
+        let output_bch: u64 = outputs.iter().map(|o| o.value).sum();
+        for utxo in &sorted_bch {
+            let input_bch: u64 = all_inputs.iter().map(|i| i.value).sum();
+            if input_bch >= output_bch + 2000 {
+                break;
+            }
+            all_inputs.push(utxo.clone());
+        }
+
+        // Build, sign, and broadcast
+        let built = match transaction::build_token_transaction(
+            &all_inputs,
+            &outputs,
+            &bch_change_addr,
+            &self.hd_wallet,
+            1.2,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                let err_msg = e.to_string();
+                let lacking = if err_msg.contains("short by") {
+                    err_msg
+                        .split("short by ")
+                        .nth(1)
+                        .and_then(|s| s.split(' ').next())
+                        .and_then(|s| s.parse::<u64>().ok())
+                } else {
+                    None
+                };
+                return Ok(SendResult {
+                    success: false,
+                    txid: None,
+                    error: Some(err_msg),
+                    lacking_sats: lacking,
+                });
+            }
+        };
+
+        let broadcast_result = self.watchtower.broadcast(&built.hex).await?;
+
+        if broadcast_result.success {
+            Ok(SendResult {
+                success: true,
+                txid: broadcast_result.txid.or(Some(built.txid)),
+                error: None,
+                lacking_sats: None,
+            })
+        } else {
+            Ok(SendResult {
+                success: false,
+                txid: None,
+                error: broadcast_result.error,
+                lacking_sats: None,
+            })
+        }
     }
 
-    /// Send an NFT.
-    pub async fn send_nft(&self, _params: NftSendParams) -> Result<SendResult> {
-        todo!("CashToken NFT sends require token-aware outputs -- not yet implemented")
+    /// Send an NFT (non-fungible CashToken).
+    ///
+    /// 1. Fetches the specific NFT UTXO (by txid:vout)
+    /// 2. Fetches BCH UTXOs for fees
+    /// 3. Builds, signs, and broadcasts the transaction locally
+    pub async fn send_nft(&self, params: NftSendParams) -> Result<SendResult> {
+        let bch_change_addr = match &params.change_address {
+            Some(addr) => addr.clone(),
+            None => self.hd_wallet.get_address_set_at(0)?.change,
+        };
+
+        // Fetch the NFT UTXO to get its address_path for signing
+        let token_utxos = self
+            .watchtower
+            .get_cashtoken_utxos(&self.wallet_hash, &params.category)
+            .await
+            .context("failed to fetch token UTXOs")?;
+
+        let nft_utxo = token_utxos
+            .iter()
+            .find(|u| u.txid == params.txid && u.vout == params.vout)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NFT UTXO {}:{} not found in wallet",
+                    params.txid,
+                    params.vout
+                )
+            })?;
+
+        // Build NFT output
+        let category_bytes = transaction::decode_txid_to_bytes(&params.category)
+            .context("invalid category hex")?;
+
+        let commitment_bytes = if params.commitment.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(&params.commitment).context("invalid commitment hex")?
+        };
+
+        let capability = transaction::NftCapability::parse(&params.capability)?;
+
+        let outputs = vec![transaction::TokenTxOutput {
+            address: params.address.clone(),
+            value: transaction::token_dust(),
+            token: Some(transaction::TokenPrefix {
+                category: category_bytes,
+                nft: Some(transaction::NftData {
+                    capability,
+                    commitment: commitment_bytes,
+                }),
+                amount: 0,
+            }),
+        }];
+
+        // NFT UTXO as first input (with token data for sighash)
+        let nft_commitment_bytes = if nft_utxo.commitment.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(&nft_utxo.commitment).unwrap_or_default()
+        };
+        let nft_capability = transaction::NftCapability::parse(
+            nft_utxo.capability.as_deref().unwrap_or("none")
+        ).unwrap_or(transaction::NftCapability::None);
+        let mut all_inputs = vec![transaction::Utxo {
+            txid: nft_utxo.txid.clone(),
+            vout: nft_utxo.vout,
+            value: nft_utxo.value,
+            address_path: nft_utxo.address_path.clone(),
+            token: Some(transaction::TokenPrefix {
+                category: category_bytes,
+                nft: Some(transaction::NftData {
+                    capability: nft_capability,
+                    commitment: nft_commitment_bytes,
+                }),
+                amount: nft_utxo.token_amount,
+            }),
+        }];
+
+        // Fetch BCH UTXOs for fees
+        let bch_utxos = self
+            .watchtower
+            .get_bch_utxos(&self.wallet_hash)
+            .await
+            .context("failed to fetch BCH UTXOs")?;
+
+        let mut sorted_bch = bch_utxos.clone();
+        sorted_bch.sort_by(|a, b| b.value.cmp(&a.value));
+
+        let output_bch: u64 = outputs.iter().map(|o| o.value).sum();
+        for utxo in &sorted_bch {
+            let input_bch: u64 = all_inputs.iter().map(|i| i.value).sum();
+            if input_bch >= output_bch + 2000 {
+                break;
+            }
+            all_inputs.push(utxo.clone());
+        }
+
+        // Build, sign, and broadcast
+        let built = match transaction::build_token_transaction(
+            &all_inputs,
+            &outputs,
+            &bch_change_addr,
+            &self.hd_wallet,
+            1.2,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                let err_msg = e.to_string();
+                let lacking = if err_msg.contains("short by") {
+                    err_msg
+                        .split("short by ")
+                        .nth(1)
+                        .and_then(|s| s.split(' ').next())
+                        .and_then(|s| s.parse::<u64>().ok())
+                } else {
+                    None
+                };
+                return Ok(SendResult {
+                    success: false,
+                    txid: None,
+                    error: Some(err_msg),
+                    lacking_sats: lacking,
+                });
+            }
+        };
+
+        let broadcast_result = self.watchtower.broadcast(&built.hex).await?;
+
+        if broadcast_result.success {
+            Ok(SendResult {
+                success: true,
+                txid: broadcast_result.txid.or(Some(built.txid)),
+                error: None,
+                lacking_sats: None,
+            })
+        } else {
+            Ok(SendResult {
+                success: false,
+                txid: None,
+                error: broadcast_result.error,
+                lacking_sats: None,
+            })
+        }
     }
 
     /// List fungible CashTokens.
