@@ -28,12 +28,7 @@ pub struct Wallet {
 impl Wallet {
     /// Get a BchWallet for the given network.
     pub fn for_network(&self, chipnet: bool) -> Result<BchWallet> {
-        let project_id = if chipnet {
-            std::env::var("WATCHTOWER_CHIP_PROJECT_ID").unwrap_or_default()
-        } else {
-            std::env::var("WATCHTOWER_PROJECT_ID").unwrap_or_default()
-        };
-        BchWallet::new(&project_id, &self.mnemonic, BCH_DERIVATION_PATH, chipnet)
+        BchWallet::new(&self.mnemonic, BCH_DERIVATION_PATH, chipnet)
     }
 
     /// Get an HdWallet for the given network.
@@ -43,10 +38,6 @@ impl Wallet {
 
     pub fn wallet_hash(&self) -> &str {
         &self.wallet_hash
-    }
-
-    pub fn mnemonic(&self) -> &str {
-        &self.mnemonic
     }
 }
 

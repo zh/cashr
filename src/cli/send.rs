@@ -42,8 +42,6 @@ pub async fn run(
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
 
-    bch.ensure_synced(10).await?;
-
     let change_set = bch.get_address_set_at(0)?;
     let change_address = &change_set.change;
 
@@ -109,8 +107,6 @@ pub async fn run_send_all(
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
     let hd = w.hd_wallet(chipnet)?;
-
-    bch.ensure_synced(10).await?;
 
     // Fetch all UTXOs
     let utxos = bch.get_bch_utxos().await.context("failed to fetch UTXOs")?;

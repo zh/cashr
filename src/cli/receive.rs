@@ -118,10 +118,7 @@ pub async fn run(
         None => None,
     };
 
-    let display_amount: Option<String> = match amount {
-        Some(s) => Some(s.to_string()),
-        None => None,
-    };
+    let display_amount: Option<String> = amount.map(|s| s.to_string());
 
     if raw_amount.is_some() && is_token && !has_category {
         anyhow::bail!(

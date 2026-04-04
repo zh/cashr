@@ -36,9 +36,6 @@ pub async fn run(
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
 
-    // Ensure addresses are registered and UTXOs scanned
-    bch.ensure_synced(10).await?;
-
     if let Some(tid) = token_id {
         // Validate hex format
         if tid.len() != 64 || !tid.chars().all(|c| c.is_ascii_hexdigit()) {

@@ -22,7 +22,7 @@ fn format_token_amount(raw_amount: f64, decimals: u32) -> String {
     format!("{:.prec$}", scaled, prec = decimals as usize)
 }
 
-/// List fungible CashTokens in the wallet.
+/// List all CashTokens (fungible + NFTs) in the wallet.
 pub async fn list(wallet_name: Option<&str>, chipnet: bool) -> Result<()> {
     let network_name = if chipnet { "chipnet" } else { "mainnet" };
 
@@ -34,16 +34,24 @@ pub async fn list(wallet_name: Option<&str>, chipnet: bool) -> Result<()> {
         format!("CashTokens — {} ({})", w.name, network_name).bold()
     );
 
+    // Fungible tokens
     let tokens = bch
         .get_fungible_tokens()
         .await
         .context("failed to fetch tokens")?;
 
-    if tokens.is_empty() {
+    // NFTs
+    let nfts = bch
+        .get_nft_utxos(None)
+        .await
+        .context("failed to fetch NFTs")?;
+
+    if tokens.is_empty() && nfts.is_empty() {
         println!("   {}\n", "No tokens found.".dimmed());
         return Ok(());
     }
 
+    // Show fungible tokens
     for t in &tokens {
         let amount = format_token_amount(t.balance, t.decimals);
         let symbol = if !t.symbol.is_empty() {
@@ -65,12 +73,51 @@ pub async fn list(wallet_name: Option<&str>, chipnet: bool) -> Result<()> {
         println!();
     }
 
+    // Show NFTs grouped by category
+    if !nfts.is_empty() {
+        // Group by category
+        let mut by_cat: std::collections::BTreeMap<String, Vec<_>> = std::collections::BTreeMap::new();
+        for nft in &nfts {
+            by_cat.entry(nft.category.clone()).or_default().push(nft);
+        }
+
+        for (cat, cat_nfts) in &by_cat {
+            println!(
+                "   {}",
+                format!("{} NFT{}", cat_nfts.len(), if cat_nfts.len() != 1 { "s" } else { "" }).bold()
+            );
+            println!("   {}", cat.dimmed());
+
+            for nft in cat_nfts {
+                let cap = if nft.capability != "none" {
+                    format!(" [{}]", nft.capability)
+                } else {
+                    String::new()
+                };
+                let commit = if nft.commitment.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    short_hex(&nft.commitment, 8)
+                };
+                println!(
+                    "   {}",
+                    format!("  {}{}", commit, cap).cyan()
+                );
+            }
+            println!();
+        }
+    }
+
+    let total = tokens.len() + nfts.len();
     println!(
         "   {}",
         format!(
-            "{} token{} total",
+            "{} item{} total ({} fungible, {} NFT{})",
+            total,
+            if total != 1 { "s" } else { "" },
             tokens.len(),
-            if tokens.len() != 1 { "s" } else { "" }
+            nfts.len(),
+            if nfts.len() != 1 { "s" } else { "" }
         )
         .dimmed()
     );
@@ -248,17 +295,30 @@ pub async fn send(
     Ok(())
 }
 
+/// Parameters for the CLI send-nft command.
+pub struct SendNftArgs<'a> {
+    pub wallet_name: Option<&'a str>,
+    pub address: &'a str,
+    pub category: &'a str,
+    pub commitment: &'a str,
+    pub capability: &'a str,
+    pub txid: Option<&'a str>,
+    pub vout: Option<u32>,
+    pub chipnet: bool,
+}
+
 /// Send an NFT (non-fungible CashToken).
-pub async fn send_nft(
-    wallet_name: Option<&str>,
-    address: &str,
-    category: &str,
-    commitment: &str,
-    capability: &str,
-    txid: Option<&str>,
-    vout: Option<u32>,
-    chipnet: bool,
-) -> Result<()> {
+pub async fn send_nft(args: SendNftArgs<'_>) -> Result<()> {
+    let SendNftArgs {
+        wallet_name,
+        address,
+        category,
+        commitment,
+        capability,
+        txid,
+        vout,
+        chipnet,
+    } = args;
     let network_name = if chipnet { "chipnet" } else { "mainnet" };
 
     // Validate category

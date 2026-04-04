@@ -52,14 +52,6 @@ impl HdWallet {
         self.chipnet
     }
 
-    pub fn mnemonic(&self) -> &str {
-        &self.mnemonic
-    }
-
-    pub fn derivation_path(&self) -> &str {
-        &self.derivation_path
-    }
-
     /// Derive the main HD node at the account-level derivation path.
     fn get_main_node(&self) -> Result<XPrv> {
         let mnemonic: bip39::Mnemonic = self
@@ -120,12 +112,6 @@ impl HdWallet {
         Ok(out)
     }
 
-    /// WIF-encoded private key at sub-path.
-    pub fn get_private_key_wif_at(&self, path: &str) -> Result<String> {
-        let key = self.get_private_key_at(path)?;
-        Ok(encode_wif(&key))
-    }
-
     /// Compressed public key as hex string at sub-path.
     pub fn get_pubkey_at(&self, path: &str) -> Result<String> {
         let node = self.get_node_at(path)?;
@@ -184,15 +170,6 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
-/// WIF encoding: 0x80 + 32-byte key + 0x01 (compressed) -> Base58Check.
-fn encode_wif(private_key: &[u8; 32]) -> String {
-    let mut data = Vec::with_capacity(34);
-    data.push(0x80); // mainnet version byte
-    data.extend_from_slice(private_key);
-    data.push(0x01); // compressed flag
-    bs58::encode(data).with_check().into_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,7 +204,6 @@ mod tests {
         assert!(wallet.is_ok());
         let w = wallet.unwrap();
         assert!(!w.is_chipnet());
-        assert_eq!(w.mnemonic(), TEST_MNEMONIC);
     }
 
     #[test]
@@ -293,14 +269,6 @@ mod tests {
         assert_ne!(addr0, addr1);
         assert_ne!(addr1, addr2);
         assert_ne!(addr0, addr2);
-    }
-
-    #[test]
-    fn test_wif_encoding() {
-        let wallet = HdWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
-        let wif = wallet.get_private_key_wif_at("0/0").unwrap();
-        // WIF for compressed mainnet starts with 'K' or 'L'
-        assert!(wif.starts_with('K') || wif.starts_with('L'));
     }
 
     #[test]

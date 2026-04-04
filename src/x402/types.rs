@@ -70,69 +70,6 @@ pub struct PaymentPayload {
     pub extensions: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct VerifyResponse {
-    pub is_valid: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub invalid_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remaining_balance_sat: Option<String>,
-}
-
-/// Result of an x402 payment attempt.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct X402PaymentResult {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<X402Response>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub txid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub settlement: Option<X402Settlement>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct X402Response {
-    pub status: u16,
-    #[serde(rename = "statusText")]
-    pub status_text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct X402Settlement {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub txid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// All x402 error codes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    MissingAuthorization,
-    InvalidPayload,
-    InvalidScheme,
-    InvalidNetwork,
-    InvalidReceiverAddress,
-    InvalidExactBchPayloadSignature,
-    InsufficientUtxoBalance,
-    UtxoNotFound,
-    NoUtxoFoundForAddress,
-    UnexpectedUtxoValidationError,
-    UnexpectedVerifyError,
-    UnexpectedSettleError,
-    InvalidX402Version,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,29 +182,4 @@ mod tests {
         assert_eq!(payload, parsed);
     }
 
-    #[test]
-    fn test_verify_response_roundtrip() {
-        let resp = VerifyResponse {
-            is_valid: true,
-            payer: Some("addr".to_string()),
-            invalid_reason: None,
-            remaining_balance_sat: Some("50000".to_string()),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("isValid"));
-        assert!(json.contains("remainingBalanceSat"));
-        let parsed: VerifyResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(resp, parsed);
-    }
-
-    #[test]
-    fn test_error_code_serde() {
-        let code = ErrorCode::MissingAuthorization;
-        let json = serde_json::to_string(&code).unwrap();
-        assert_eq!(json, "\"missing_authorization\"");
-
-        let code2 = ErrorCode::InvalidExactBchPayloadSignature;
-        let json2 = serde_json::to_string(&code2).unwrap();
-        assert_eq!(json2, "\"invalid_exact_bch_payload_signature\"");
-    }
 }

@@ -63,8 +63,6 @@ pub async fn run(
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
 
-    bch.ensure_synced(10).await?;
-
     // Resolve token label for header
     let mut header_label = "Transaction History".to_string();
     if !tid.is_empty() {
@@ -135,6 +133,33 @@ pub async fn run(
         };
 
         println!("   {}  {}", arrow, amount_colored);
+
+        // Show token changes if any (indented under the BCH line)
+        for tc in &tx.token_changes {
+            let short_cat = if tc.category.len() > 16 {
+                format!("{}...{}", &tc.category[..8], &tc.category[tc.category.len()-6..])
+            } else {
+                tc.category.clone()
+            };
+
+            if tc.amount.abs() > 0.0 {
+                let ft_str = if tc.amount > 0.0 {
+                    format!("+{} tokens [{}]", tc.amount as i64, short_cat).green().to_string()
+                } else {
+                    format!("{} tokens [{}]", tc.amount as i64, short_cat).red().to_string()
+                };
+                println!("         {}", ft_str);
+            }
+            if tc.nft_amount.abs() > 0.0 {
+                let nft_str = if tc.nft_amount > 0.0 {
+                    format!("+{} NFT [{}]", tc.nft_amount as i64, short_cat).green().to_string()
+                } else {
+                    format!("{} NFT [{}]", tc.nft_amount as i64, short_cat).red().to_string()
+                };
+                println!("         {}", nft_str);
+            }
+        }
+
         println!("{}", format!("         {}", date).dimmed());
         println!(
             "{}",

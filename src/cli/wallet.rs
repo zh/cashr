@@ -37,7 +37,7 @@ pub async fn create(name: &str, chipnet: bool) -> Result<()> {
     println!();
     println!("   {}", format!("Wallet hash: {}", info.wallet_hash).dimmed());
 
-    // Derive and show address, subscribe with Watchtower
+    // Derive and show address
     if let Ok(w) = wallet::load_wallet(Some(name)) {
         if let Ok(bch) = w.for_network(chipnet) {
             if let Ok(addr_set) = bch.get_address_set_at(0) {
@@ -47,8 +47,6 @@ pub async fn create(name: &str, chipnet: bool) -> Result<()> {
                     format!("Address:     {}", addr_set.receiving).dimmed()
                 );
             }
-            // Subscribe to Watchtower (non-critical)
-            let _ = bch.get_new_address_set(0).await;
         }
     }
 
@@ -90,14 +88,6 @@ pub async fn import(name: &str, chipnet: bool) -> Result<()> {
                     "   {}",
                     format!("Address:     {}", addr_set.receiving).dimmed()
                 );
-            }
-            // Register addresses 0-9 with Watchtower and trigger UTXO scan
-            println!("   {}", "Registering addresses with Watchtower...".dimmed());
-            if let Err(e) = bch.scan_addresses(0, 10).await {
-                println!("   {}", format!("Warning: address scan failed: {}", e).yellow());
-            }
-            if let Err(e) = bch.scan_utxos(false).await {
-                println!("   {}", format!("Warning: UTXO scan failed: {}", e).yellow());
             }
         }
     }
@@ -206,32 +196,6 @@ pub fn set_default(name: &str) -> Result<()> {
     }
     storage::set_default_wallet(name)?;
     println!("\n   {}\n", format!("'{}' is now the default wallet.", name).green());
-    Ok(())
-}
-
-/// Re-scan addresses and UTXOs with Watchtower.
-pub async fn scan(wallet_name: Option<&str>, count: u32, chipnet: bool) -> Result<()> {
-    let network = if chipnet { "chipnet" } else { "mainnet" };
-
-    let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
-
-    println!(
-        "\n   {}",
-        format!("Scanning {} addresses on {}...", count, network).dimmed()
-    );
-
-    bch.scan_addresses(0, count)
-        .await
-        .context("failed to register addresses with Watchtower")?;
-
-    println!("   {}", "Addresses registered. Triggering UTXO scan...".dimmed());
-
-    bch.scan_utxos(false)
-        .await
-        .context("failed to trigger UTXO scan")?;
-
-    println!("\n   {}\n", "Scan complete.".green());
     Ok(())
 }
 

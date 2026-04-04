@@ -247,6 +247,7 @@ pub fn build_p2pkh_transaction(
             utxo.value,
             SIGHASH_ALL_FORKID,
             &cache,
+            None, // no token prefix for plain BCH
         );
 
         // Sign
@@ -337,7 +338,7 @@ pub fn build_send_all_transaction(
         let prev_script = p2pkh_script_from_pubkey_bytes(&pubkey_bytes);
 
         let sighash = sighash_forkid(
-            &raw_tx, i, &prev_script, utxo.value, SIGHASH_ALL_FORKID, &cache,
+            &raw_tx, i, &prev_script, utxo.value, SIGHASH_ALL_FORKID, &cache, None,
         );
 
         let secret_key = SecretKey::from_slice(&private_key_bytes).context("invalid private key")?;
@@ -428,16 +429,15 @@ pub fn build_token_transaction(
         );
     }
 
-    let fee;
-    if input_total >= output_total + fee_with_change + DUST_LIMIT {
+    let fee = if input_total >= output_total + fee_with_change + DUST_LIMIT {
         let change_amount = input_total - output_total - fee_with_change;
         let change_script = p2pkh_script_from_address(change_address)
             .context("failed to create change script")?;
         output_scripts.push((change_amount, change_script));
-        fee = fee_with_change;
+        fee_with_change
     } else {
-        fee = input_total - output_total;
-    }
+        input_total - output_total
+    };
 
     // Build unsigned transaction
     let mut raw_tx = RawTx {
@@ -471,20 +471,17 @@ pub fn build_token_transaction(
         let pubkey_bytes = hex::decode(&pubkey_hex).context("invalid pubkey hex")?;
         let p2pkh_script = p2pkh_script_from_pubkey_bytes(&pubkey_bytes);
 
-        // For token UTXOs, the scriptCode includes the token prefix before the P2PKH script.
-        // CHIP-2022-02: "the full encoded token prefix must be inserted immediately
-        // before the coveredBytecode in the signing serialization."
-        let script_code = match &utxo.token {
-            Some(token) => {
-                let mut sc = serialize_token_prefix(token);
-                sc.extend_from_slice(&p2pkh_script);
-                sc
-            }
-            None => p2pkh_script,
-        };
+        // For token UTXOs, the token prefix is a SEPARATE field in the sighash preimage,
+        // placed before the coveredBytecode (which is just the P2PKH script).
+        // See libauth's encodeSigningSerializationBCH:
+        //   outputTokenPrefix,                    ← raw bytes, no length prefix
+        //   bigIntToCompactSize(coveredBytecode.length),  ← length of JUST P2PKH
+        //   coveredBytecode,                       ← JUST the P2PKH script
+        let token_prefix_bytes = utxo.token.as_ref().map(serialize_token_prefix);
 
         let sighash = sighash_forkid(
-            &raw_tx, i, &script_code, utxo.value, SIGHASH_ALL_FORKID, &cache,
+            &raw_tx, i, &p2pkh_script, utxo.value, SIGHASH_ALL_FORKID, &cache,
+            token_prefix_bytes.as_deref(),
         );
 
         let secret_key = SecretKey::from_slice(&private_key_bytes).context("invalid private key")?;
@@ -579,6 +576,7 @@ fn sighash_forkid(
     utxo_value: u64,
     hash_type: u32,
     cache: &SighashCache,
+    token_prefix: Option<&[u8]>,
 ) -> [u8; 32] {
     let mut preimage = Vec::with_capacity(256);
 
@@ -596,7 +594,13 @@ fn sighash_forkid(
     preimage.extend_from_slice(&input.prev_txid);
     preimage.extend_from_slice(&input.prev_vout.to_le_bytes());
 
-    // 5. script_code [varint + bytes]
+    // 5. token prefix + script_code
+    // Per CHIP-2022-02 / libauth: the token prefix is a SEPARATE field
+    // placed before the coveredBytecode length. The coveredBytecode length
+    // covers ONLY the locking script (P2PKH), not the token prefix.
+    if let Some(prefix) = token_prefix {
+        preimage.extend_from_slice(prefix); // raw token prefix bytes, no length
+    }
     write_varint(&mut preimage, prev_script.len() as u64);
     preimage.extend_from_slice(prev_script);
 
@@ -1082,6 +1086,7 @@ mod tests {
             5000,
             SIGHASH_ALL_FORKID,
             &cache,
+            None,
         );
 
         assert_eq!(sighash.len(), 32);

@@ -1,25 +1,26 @@
-/// BchWallet: business logic combining HdWallet + WatchtowerClient.
+/// BchWallet: business logic combining HdWallet + Mainnet Cash REST API.
 ///
-/// Provides all BCH wallet operations: balance, send, tokens, history.
+/// Security model:
+/// - Read operations (balance, UTXOs, history): use watch:{network}:{cashaddr} wallet ID
+/// - Broadcast: submit_transaction with watch wallet ID + locally-built raw tx hex
+/// - Key material NEVER leaves the machine
 use anyhow::{Context, Result};
 
+use crate::network;
 use crate::transaction;
-use crate::watchtower::client::{
-    BalanceResponse, CashTokenUtxo, FungibleToken, HistoryParams, HistoryResponse, NftUtxo,
-    SendResult, SubscribeRequest, WatchtowerClient,
+use crate::types::{
+    BalanceResponse, BroadcastResult, CashTokenUtxo, FungibleToken, HistoryResponse,
+    NftUtxo, SendResult,
 };
 
 use super::keys::{AddressSet, HdWallet};
 
-/// Core BCH wallet combining key derivation with Watchtower API.
+/// Core BCH wallet combining local key derivation with Mainnet Cash REST API.
 pub struct BchWallet {
-    chipnet: bool,
     wallet_hash: String,
     hd_wallet: HdWallet,
-    watchtower: WatchtowerClient,
-    project_id: String,
-    mnemonic: String,
-    derivation_path: String,
+    api_config: mainnet::apis::configuration::Configuration,
+    watch_id: String,
 }
 
 /// Options for fetching transaction history.
@@ -42,28 +43,19 @@ pub struct NftSendParams {
 
 impl BchWallet {
     /// Create a new BchWallet.
-    pub fn new(project_id: &str, mnemonic: &str, path: &str, chipnet: bool) -> Result<Self> {
+    pub fn new(mnemonic: &str, path: &str, chipnet: bool) -> Result<Self> {
         let hd_wallet = HdWallet::new(mnemonic, path, chipnet)?;
         let wallet_hash = hd_wallet.wallet_hash().to_string();
-        let watchtower = WatchtowerClient::new(chipnet);
+        let addr = hd_wallet.get_address_set_at(0)?.receiving;
+        let api_config = network::mainnet_config(chipnet);
+        let watch_id = network::watch_wallet_id(chipnet, &addr);
 
         Ok(Self {
-            chipnet,
             wallet_hash,
             hd_wallet,
-            watchtower,
-            project_id: project_id.to_string(),
-            mnemonic: mnemonic.to_string(),
-            derivation_path: path.to_string(),
+            api_config,
+            watch_id,
         })
-    }
-
-    pub fn wallet_hash(&self) -> &str {
-        &self.wallet_hash
-    }
-
-    pub fn is_chipnet(&self) -> bool {
-        self.chipnet
     }
 
     /// Derive receiving + change addresses at index (delegates to HdWallet).
@@ -76,136 +68,380 @@ impl BchWallet {
         self.hd_wallet.get_token_address_set_at(index)
     }
 
-    /// Subscribe a new address set with Watchtower for monitoring.
-    pub async fn get_new_address_set(&self, index: u32) -> Result<Option<AddressSet>> {
-        let addresses = self.hd_wallet.get_address_set_at(index)?;
-        // Subscribe receiving address
-        let recv_result = self
-            .watchtower
-            .subscribe(&SubscribeRequest {
-                address: addresses.receiving.clone(),
-                project_id: self.project_id.clone(),
-                wallet_hash: Some(self.wallet_hash.clone()),
-                wallet_index: Some(index),
-            })
-            .await?;
-        // Subscribe change address
-        let _ = self
-            .watchtower
-            .subscribe(&SubscribeRequest {
-                address: addresses.change.clone(),
-                project_id: self.project_id.clone(),
-                wallet_hash: Some(self.wallet_hash.clone()),
-                wallet_index: Some(index),
-            })
-            .await;
-        if recv_result.success {
-            Ok(Some(addresses))
-        } else {
-            Ok(None)
-        }
-    }
+    // ── Read operations (watch wallet ID -- no keys exposed) ────────
 
-    /// Register addresses and trigger UTXO scan with Watchtower.
-    /// Called automatically before balance-sensitive operations.
-    pub async fn ensure_synced(&self, address_count: u32) -> Result<()> {
-        let _ = self.scan_addresses(0, address_count).await;
-        let _ = self.scan_utxos(true).await;
-        Ok(())
-    }
-
-    /// Get wallet BCH balance.
+    /// Get wallet BCH balance via Mainnet Cash API.
     pub async fn get_balance(&self) -> Result<BalanceResponse> {
-        self.watchtower.get_balance(&self.wallet_hash).await
+        let resp = mainnet::apis::wallet_api::balance(
+            &self.api_config,
+            mainnet::models::BalanceRequest {
+                wallet_id: self.watch_id.clone(),
+                slp_semi_aware: None,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("balance request failed: {:?}", e))?;
+
+        let sat_str = resp.sat.unwrap_or_default();
+        let sats: f64 = sat_str.parse().unwrap_or(0.0);
+        Ok(BalanceResponse {
+            valid: true,
+            wallet: self.wallet_hash.clone(),
+            balance: sats / 1e8,
+            spendable: sats / 1e8,
+        })
     }
 
-    /// Get token balance.
-    pub async fn get_token_balance(&self, token_id: &str) -> Result<BalanceResponse> {
-        self.watchtower
-            .get_token_balance(&self.wallet_hash, token_id)
+    /// Get token balance for a specific category.
+    pub async fn get_token_balance(&self, category: &str) -> Result<BalanceResponse> {
+        let resp = mainnet::apis::wallet_api::get_token_balance(
+            &self.api_config,
+            mainnet::models::GetTokenBalanceRequest {
+                wallet_id: self.watch_id.clone(),
+                category: category.to_string(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("token balance request failed: {:?}", e))?;
+
+        let balance = resp.balance.unwrap_or(0.0);
+        Ok(BalanceResponse {
+            valid: true,
+            wallet: self.wallet_hash.clone(),
+            balance,
+            spendable: balance,
+        })
+    }
+
+    /// Get BCH (non-token) UTXOs via Mainnet Cash API.
+    pub async fn get_bch_utxos(&self) -> Result<Vec<transaction::Utxo>> {
+        let watch = serde_json::json!({ "walletId": self.watch_id });
+        let utxos = mainnet::apis::wallet_api::utxos(&self.api_config, watch)
             .await
-    }
+            .map_err(|e| anyhow::anyhow!("UTXO request failed: {:?}", e))?;
 
-    /// Get transaction history.
-    pub async fn get_history(&self, opts: HistoryOptions) -> Result<HistoryResponse> {
-        let params = HistoryParams {
-            wallet_hash: self.wallet_hash.clone(),
-            token_id: opts.token_id,
-            page: opts.page,
-            record_type: opts.record_type,
-        };
-        self.watchtower.get_history(&params).await
-    }
-
-    /// Get last used address index from Watchtower.
-    pub async fn get_last_address_index(&self) -> Result<Option<u32>> {
-        self.watchtower
-            .get_last_address_index(&self.wallet_hash)
-            .await
-    }
-
-    /// Subscribe a range of addresses to Watchtower for monitoring.
-    /// Registers both regular (q-prefix) and token-aware (z-prefix) addresses.
-    pub async fn scan_addresses(&self, start_index: u32, count: u32) -> Result<()> {
-        let end_index = start_index + count;
-        for i in start_index..end_index {
-            // Regular addresses (q-prefix)
-            let addrs = self.hd_wallet.get_address_set_at(i)?;
-            let _ = self
-                .watchtower
-                .subscribe(&SubscribeRequest {
-                    address: addrs.receiving,
-                    project_id: self.project_id.clone(),
-                    wallet_hash: Some(self.wallet_hash.clone()),
-                    wallet_index: Some(i),
-                })
-                .await;
-            let _ = self
-                .watchtower
-                .subscribe(&SubscribeRequest {
-                    address: addrs.change,
-                    project_id: self.project_id.clone(),
-                    wallet_hash: Some(self.wallet_hash.clone()),
-                    wallet_index: Some(i),
-                })
-                .await;
-
-            // Token-aware addresses (z-prefix)
-            let token_addrs = self.hd_wallet.get_token_address_set_at(i)?;
-            let _ = self
-                .watchtower
-                .subscribe(&SubscribeRequest {
-                    address: token_addrs.receiving,
-                    project_id: self.project_id.clone(),
-                    wallet_hash: Some(self.wallet_hash.clone()),
-                    wallet_index: Some(i),
-                })
-                .await;
-            let _ = self
-                .watchtower
-                .subscribe(&SubscribeRequest {
-                    address: token_addrs.change,
-                    project_id: self.project_id.clone(),
-                    wallet_hash: Some(self.wallet_hash.clone()),
-                    wallet_index: Some(i),
-                })
-                .await;
+        let mut result = Vec::new();
+        for u in utxos {
+            // Skip token UTXOs
+            if let Some(Some(_token)) = &u.token {
+                continue;
+            }
+            let value = u.satoshis as u64;
+            if value < 546 {
+                continue; // Skip dust
+            }
+            result.push(transaction::Utxo {
+                txid: u.txid,
+                vout: u.vout as u32,
+                value,
+                address_path: "0/0".to_string(),
+                token: None,
+            });
         }
-        Ok(())
+        Ok(result)
     }
 
-    /// Trigger a UTXO scan.
-    pub async fn scan_utxos(&self, background: bool) -> Result<()> {
-        self.watchtower
-            .scan_utxos(&self.wallet_hash, background)
-            .await
+    /// Get CashToken UTXOs for a specific category.
+    pub async fn get_cashtoken_utxos(&self, category: &str) -> Result<Vec<CashTokenUtxo>> {
+        let resp = mainnet::apis::wallet_api::get_token_utxos(
+            &self.api_config,
+            mainnet::models::GetTokenUtxosRequest {
+                wallet_id: self.watch_id.clone(),
+                category: Some(Some(category.to_string())),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("token UTXO request failed: {:?}", e))?;
+
+        let mut utxos = Vec::new();
+        for u in resp {
+            let token = match &u.token {
+                Some(Some(t)) => t,
+                _ => continue,
+            };
+
+            let cat = token.category.clone().unwrap_or_default();
+            if cat != category {
+                continue;
+            }
+
+            let token_amount = token.amount.unwrap_or(0.0) as u64;
+            let (commitment, capability) = match &token.nft {
+                Some(Some(nft)) => {
+                    let cap = match nft.capability {
+                        mainnet::models::token_nft::Capability::None => Some("none".to_string()),
+                        mainnet::models::token_nft::Capability::Mutable => {
+                            Some("mutable".to_string())
+                        }
+                        mainnet::models::token_nft::Capability::Minting => {
+                            Some("minting".to_string())
+                        }
+                    };
+                    (nft.commitment.clone(), cap)
+                }
+                _ => (String::new(), None),
+            };
+
+            utxos.push(CashTokenUtxo {
+                txid: u.txid,
+                vout: u.vout as u32,
+                value: u.satoshis as u64,
+                address_path: "0/0".to_string(),
+                token_amount,
+                commitment,
+                capability,
+            });
+        }
+
+        Ok(utxos)
     }
+
+    /// Broadcast a raw transaction hex via Mainnet Cash API.
+    pub async fn broadcast(&self, tx_hex: &str) -> Result<BroadcastResult> {
+        let resp = mainnet::apis::wallet_api::submit_transaction(
+            &self.api_config,
+            mainnet::models::SubmitTransactionRequest {
+                wallet_id: self.watch_id.clone(),
+                transaction_hex: tx_hex.to_string(),
+                await_propagation: Some(true),
+            },
+        )
+        .await;
+
+        match resp {
+            Ok(r) => Ok(BroadcastResult {
+                txid: r.tx_id,
+                success: true,
+                error: None,
+            }),
+            Err(e) => Ok(BroadcastResult {
+                txid: None,
+                success: false,
+                error: Some(format!("{:?}", e)),
+            }),
+        }
+    }
+
+    /// Get transaction history via Mainnet Cash API.
+    pub async fn get_history(&self, opts: HistoryOptions) -> Result<HistoryResponse> {
+        // Mainnet API uses start/count for pagination, not page numbers.
+        // Each "page" is 10 items.
+        let page_size: f64 = 10.0;
+        let start = ((opts.page as f64) - 1.0) * page_size;
+
+        let items = mainnet::apis::wallet_api::get_history(
+            &self.api_config,
+            mainnet::models::HistoryRequest {
+                wallet_id: self.watch_id.clone(),
+                unit: Some(mainnet::models::history_request::Unit::Sat),
+                from_height: None,
+                to_height: None,
+                start: Some(start),
+                count: Some(page_size + 1.0), // fetch one extra to detect has_next
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("history request failed: {:?}", e))?;
+
+        let has_next = items.len() > page_size as usize;
+        let display_items: Vec<_> = items.into_iter().take(page_size as usize).collect();
+
+        // Convert mainnet TransactionHistoryItem to our HistoryEntry format
+        let history: Vec<crate::types::HistoryEntry> = display_items
+            .iter()
+            .map(|item| {
+                let value_change = item.value_change.unwrap_or(0.0);
+                let is_incoming = value_change > 0.0;
+                let record_type = if is_incoming { "incoming" } else { "outgoing" };
+
+                // value_change is in satoshis (we requested unit=sat)
+                // Convert to BCH for display compatibility, unless token_id is set
+                let amount = if opts.token_id.is_empty() {
+                    value_change.abs() / 1e8
+                } else {
+                    // For token history, look at token_amount_changes
+                    if let Some(changes) = &item.token_amount_changes {
+                        changes
+                            .iter()
+                            .find(|c| {
+                                c.category.as_deref() == Some(&opts.token_id)
+                            })
+                            .map(|c| c.amount.unwrap_or(0.0).abs())
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    }
+                };
+
+                let timestamp = match item.timestamp {
+                    Some(ts) => {
+                        // Convert unix timestamp to ISO-ish date string
+                        let secs = ts as i64;
+                        let days = secs / 86400;
+                        let rem = secs % 86400;
+                        let hours = rem / 3600;
+                        let mins = (rem % 3600) / 60;
+                        // Simple epoch-days to date (good enough for display)
+                        // 1970-01-01 is day 0
+                        let (y, m, d) = epoch_days_to_date(days);
+                        format!("{:04}-{:02}-{:02} {:02}:{:02} UTC", y, m, d, hours, mins)
+                    }
+                    None => String::new(),
+                };
+
+                // Extract token changes
+                let token_changes: Vec<crate::types::TokenChange> = item
+                    .token_amount_changes
+                    .as_ref()
+                    .map(|changes| {
+                        changes
+                            .iter()
+                            .map(|c| crate::types::TokenChange {
+                                category: c.category.clone().unwrap_or_default(),
+                                amount: c.amount.unwrap_or(0.0),
+                                nft_amount: c.nft_amount.unwrap_or(0.0),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                crate::types::HistoryEntry {
+                    record_type: record_type.to_string(),
+                    txid: item.hash.clone().unwrap_or_default(),
+                    amount,
+                    tx_fee: item.fee.unwrap_or(0.0) / 1e8,
+                    senders: serde_json::Value::Null,
+                    recipients: serde_json::Value::Null,
+                    date_created: String::new(),
+                    tx_timestamp: timestamp,
+                    usd_price: 0.0,
+                    market_prices: serde_json::Value::Null,
+                    attributes: serde_json::Value::Null,
+                    token_changes,
+                }
+            })
+            .collect();
+
+        // Filter by record_type if specified
+        let filtered = if opts.record_type == "all" {
+            history
+        } else {
+            history
+                .into_iter()
+                .filter(|h| h.record_type == opts.record_type)
+                .collect()
+        };
+
+        Ok(HistoryResponse {
+            history: filtered,
+            page: opts.page.to_string(),
+            num_pages: if has_next { opts.page + 1 } else { opts.page },
+            has_next,
+        })
+    }
+
+    /// List all fungible CashToken balances, with BCMR metadata.
+    pub async fn get_fungible_tokens(&self) -> Result<Vec<FungibleToken>> {
+        let balances = mainnet::apis::wallet_api::get_all_token_balances(
+            &self.api_config,
+            mainnet::models::GetAllTokenBalancesRequest {
+                wallet_id: self.watch_id.clone(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("token balances request failed: {:?}", e))?;
+
+        let mut tokens = Vec::new();
+        for (category, amount_str) in balances {
+            let amount: f64 = amount_str.parse().unwrap_or(0.0);
+            if amount <= 0.0 {
+                continue;
+            }
+
+            // Fetch BCMR metadata for this category
+            let (name, symbol, decimals) = self.fetch_bcmr_metadata(&category).await;
+
+            tokens.push(FungibleToken {
+                id: category.clone(),
+                category,
+                name,
+                symbol,
+                decimals,
+                image_url: String::new(),
+                balance: amount,
+            });
+        }
+
+        Ok(tokens)
+    }
+
+    /// Get info for a specific CashToken (BCMR metadata).
+    pub async fn get_token_info(&self, category: &str) -> Result<Option<FungibleToken>> {
+        let (name, symbol, decimals) = self.fetch_bcmr_metadata(category).await;
+
+        // Even if BCMR returns nothing, we still return a token with unknown name
+        Ok(Some(FungibleToken {
+            id: category.to_string(),
+            category: category.to_string(),
+            name,
+            symbol,
+            decimals,
+            image_url: String::new(),
+            balance: 0.0,
+        }))
+    }
+
+    /// Get NFT UTXOs, optionally filtered by category.
+    pub async fn get_nft_utxos(&self, category: Option<&str>) -> Result<Vec<NftUtxo>> {
+        let req = mainnet::models::GetTokenUtxosRequest {
+            wallet_id: self.watch_id.clone(),
+            category: category.map(|c| Some(c.to_string())),
+        };
+
+        let utxos = mainnet::apis::wallet_api::get_token_utxos(&self.api_config, req)
+            .await
+            .map_err(|e| anyhow::anyhow!("NFT UTXO request failed: {:?}", e))?;
+
+        let mut nfts = Vec::new();
+        for u in utxos {
+            let token = match &u.token {
+                Some(Some(t)) => t,
+                _ => continue,
+            };
+
+            // NFTs have a non-null nft field
+            let nft = match &token.nft {
+                Some(Some(n)) => n,
+                _ => continue,
+            };
+
+            let cap = match nft.capability {
+                mainnet::models::token_nft::Capability::None => "none",
+                mainnet::models::token_nft::Capability::Mutable => "mutable",
+                mainnet::models::token_nft::Capability::Minting => "minting",
+            };
+
+            nfts.push(NftUtxo {
+                txid: u.txid,
+                vout: u.vout as u32,
+                category: token.category.clone().unwrap_or_default(),
+                commitment: nft.commitment.clone(),
+                capability: cap.to_string(),
+                amount: token.amount.unwrap_or(0.0),
+                value: u.satoshis,
+            });
+        }
+
+        Ok(nfts)
+    }
+
+    // ── Send operations (local signing + broadcast) ─────────────────
 
     /// Send BCH to a recipient using native transaction building.
     ///
-    /// 1. Fetches UTXOs from Watchtower
+    /// 1. Fetches UTXOs from Mainnet Cash API
     /// 2. Builds and signs transaction locally
-    /// 3. Broadcasts via Watchtower
+    /// 3. Broadcasts via Mainnet Cash API
     pub async fn send_bch(
         &self,
         amount: f64,
@@ -232,10 +468,7 @@ impl BchWallet {
         }
 
         // Fetch UTXOs
-        let utxos = self
-            .watchtower
-            .get_bch_utxos(&self.wallet_hash)
-            .await?;
+        let utxos = self.get_bch_utxos().await?;
 
         if utxos.is_empty() {
             return Ok(SendResult {
@@ -263,7 +496,6 @@ impl BchWallet {
             Ok(tx) => tx,
             Err(e) => {
                 let err_msg = e.to_string();
-                // Try to extract lacking sats from error message
                 let lacking = if err_msg.contains("short by") {
                     err_msg
                         .split("short by ")
@@ -283,7 +515,7 @@ impl BchWallet {
         };
 
         // Broadcast
-        let broadcast_result = self.watchtower.broadcast(&built.hex).await?;
+        let broadcast_result = self.broadcast(&built.hex).await?;
 
         if broadcast_result.success {
             Ok(SendResult {
@@ -302,25 +534,7 @@ impl BchWallet {
         }
     }
 
-    /// Fetch BCH UTXOs from Watchtower.
-    pub async fn get_bch_utxos(&self) -> Result<Vec<crate::transaction::Utxo>> {
-        self.watchtower.get_bch_utxos(&self.wallet_hash).await
-    }
-
-    /// Broadcast a raw transaction hex via Watchtower.
-    pub async fn broadcast(
-        &self,
-        tx_hex: &str,
-    ) -> Result<crate::watchtower::client::BroadcastResult> {
-        self.watchtower.broadcast(tx_hex).await
-    }
-
     /// Send fungible CashTokens.
-    ///
-    /// 1. Fetches token UTXOs for the category
-    /// 2. Selects enough to cover the send amount
-    /// 3. Fetches BCH UTXOs for fees
-    /// 4. Builds, signs, and broadcasts the transaction locally
     pub async fn send_token(
         &self,
         category: &str,
@@ -336,8 +550,7 @@ impl BchWallet {
 
         // Fetch token UTXOs for this category
         let token_utxos = self
-            .watchtower
-            .get_cashtoken_utxos(&self.wallet_hash, category)
+            .get_cashtoken_utxos(category)
             .await
             .context("failed to fetch token UTXOs")?;
 
@@ -380,8 +593,8 @@ impl BchWallet {
         }
 
         // Build token outputs
-        let category_bytes = transaction::decode_txid_to_bytes(category)
-            .context("invalid category hex")?;
+        let category_bytes =
+            transaction::decode_txid_to_bytes(category).context("invalid category hex")?;
 
         let mut outputs = vec![transaction::TokenTxOutput {
             address: address.to_string(),
@@ -407,7 +620,7 @@ impl BchWallet {
             });
         }
 
-        // Convert selected token UTXOs to transaction inputs (with token data for sighash)
+        // Convert selected token UTXOs to transaction inputs
         let mut all_inputs: Vec<transaction::Utxo> = selected
             .iter()
             .map(|u| transaction::Utxo {
@@ -425,8 +638,7 @@ impl BchWallet {
 
         // Fetch BCH UTXOs for fees
         let bch_utxos = self
-            .watchtower
-            .get_bch_utxos(&self.wallet_hash)
+            .get_bch_utxos()
             .await
             .context("failed to fetch BCH UTXOs")?;
 
@@ -471,7 +683,7 @@ impl BchWallet {
             }
         };
 
-        let broadcast_result = self.watchtower.broadcast(&built.hex).await?;
+        let broadcast_result = self.broadcast(&built.hex).await?;
 
         if broadcast_result.success {
             Ok(SendResult {
@@ -491,20 +703,15 @@ impl BchWallet {
     }
 
     /// Send an NFT (non-fungible CashToken).
-    ///
-    /// 1. Fetches the specific NFT UTXO (by txid:vout)
-    /// 2. Fetches BCH UTXOs for fees
-    /// 3. Builds, signs, and broadcasts the transaction locally
     pub async fn send_nft(&self, params: NftSendParams) -> Result<SendResult> {
         let bch_change_addr = match &params.change_address {
             Some(addr) => addr.clone(),
             None => self.hd_wallet.get_address_set_at(0)?.change,
         };
 
-        // Fetch the NFT UTXO to get its address_path for signing
+        // Fetch the NFT UTXO to get its data for signing
         let token_utxos = self
-            .watchtower
-            .get_cashtoken_utxos(&self.wallet_hash, &params.category)
+            .get_cashtoken_utxos(&params.category)
             .await
             .context("failed to fetch token UTXOs")?;
 
@@ -520,8 +727,8 @@ impl BchWallet {
             })?;
 
         // Build NFT output
-        let category_bytes = transaction::decode_txid_to_bytes(&params.category)
-            .context("invalid category hex")?;
+        let category_bytes =
+            transaction::decode_txid_to_bytes(&params.category).context("invalid category hex")?;
 
         let commitment_bytes = if params.commitment.is_empty() {
             Vec::new()
@@ -544,15 +751,15 @@ impl BchWallet {
             }),
         }];
 
-        // NFT UTXO as first input (with token data for sighash)
+        // NFT UTXO as first input
         let nft_commitment_bytes = if nft_utxo.commitment.is_empty() {
             Vec::new()
         } else {
             hex::decode(&nft_utxo.commitment).unwrap_or_default()
         };
-        let nft_capability = transaction::NftCapability::parse(
-            nft_utxo.capability.as_deref().unwrap_or("none")
-        ).unwrap_or(transaction::NftCapability::None);
+        let nft_capability =
+            transaction::NftCapability::parse(nft_utxo.capability.as_deref().unwrap_or("none"))
+                .unwrap_or(transaction::NftCapability::None);
         let mut all_inputs = vec![transaction::Utxo {
             txid: nft_utxo.txid.clone(),
             vout: nft_utxo.vout,
@@ -570,8 +777,7 @@ impl BchWallet {
 
         // Fetch BCH UTXOs for fees
         let bch_utxos = self
-            .watchtower
-            .get_bch_utxos(&self.wallet_hash)
+            .get_bch_utxos()
             .await
             .context("failed to fetch BCH UTXOs")?;
 
@@ -616,7 +822,7 @@ impl BchWallet {
             }
         };
 
-        let broadcast_result = self.watchtower.broadcast(&built.hex).await?;
+        let broadcast_result = self.broadcast(&built.hex).await?;
 
         if broadcast_result.success {
             Ok(SendResult {
@@ -635,24 +841,62 @@ impl BchWallet {
         }
     }
 
-    /// List fungible CashTokens.
-    pub async fn get_fungible_tokens(&self) -> Result<Vec<FungibleToken>> {
-        self.watchtower
-            .get_fungible_tokens(&self.wallet_hash)
-            .await
-    }
+    // ── Internal helpers ────────────────────────────────────────────
 
-    /// Get info for a specific CashToken.
-    pub async fn get_token_info(&self, category: &str) -> Result<Option<FungibleToken>> {
-        self.watchtower.get_token_info(category).await
-    }
+    /// Fetch BCMR token metadata (name, symbol, decimals) for a category.
+    async fn fetch_bcmr_metadata(&self, category: &str) -> (String, String, u32) {
+        let resp = mainnet::apis::wallet_bcmr_api::bcmr_get_token_info(
+            &self.api_config,
+            mainnet::models::BcmrGetTokenInfoRequest {
+                category: category.to_string(),
+            },
+        )
+        .await;
 
-    /// Get NFT UTXOs.
-    pub async fn get_nft_utxos(&self, category: Option<&str>) -> Result<Vec<NftUtxo>> {
-        self.watchtower
-            .get_nft_utxos(&self.wallet_hash, category)
-            .await
+        match resp {
+            Ok(info) => {
+                if let Some(Some(token_info)) = info.token_info {
+                    let name = token_info
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown Token")
+                        .to_string();
+                    let symbol = token_info
+                        .get("token")
+                        .and_then(|t| t.get("symbol"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let decimals = token_info
+                        .get("token")
+                        .and_then(|t| t.get("decimals"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    (name, symbol, decimals)
+                } else {
+                    ("Unknown Token".to_string(), String::new(), 0)
+                }
+            }
+            Err(_) => ("Unknown Token".to_string(), String::new(), 0),
+        }
     }
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+/// Uses the civil calendar algorithm.
+fn epoch_days_to_date(days: i64) -> (i64, i64, i64) {
+    // Algorithm from Howard Hinnant's date library
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 #[cfg(test)]
@@ -665,24 +909,13 @@ mod tests {
 
     #[test]
     fn test_bch_wallet_new() {
-        let wallet = BchWallet::new("project123", TEST_MNEMONIC, BCH_DERIVATION_PATH, false);
+        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false);
         assert!(wallet.is_ok());
-        let w = wallet.unwrap();
-        assert!(!w.is_chipnet());
-        assert!(!w.wallet_hash().is_empty());
-    }
-
-    #[test]
-    fn test_bch_wallet_chipnet() {
-        let wallet =
-            BchWallet::new("project123", TEST_MNEMONIC, BCH_DERIVATION_PATH, true).unwrap();
-        assert!(wallet.is_chipnet());
     }
 
     #[test]
     fn test_bch_wallet_address_derivation() {
-        let wallet =
-            BchWallet::new("project123", TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
         let set = wallet.get_address_set_at(0).unwrap();
         assert!(set.receiving.starts_with("bitcoincash:q"));
         assert!(set.change.starts_with("bitcoincash:q"));
@@ -690,8 +923,7 @@ mod tests {
 
     #[test]
     fn test_bch_wallet_token_address_derivation() {
-        let wallet =
-            BchWallet::new("project123", TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
         let set = wallet.get_token_address_set_at(0).unwrap();
         assert!(set.receiving.starts_with("bitcoincash:z"));
         assert!(set.change.starts_with("bitcoincash:z"));
@@ -699,7 +931,21 @@ mod tests {
 
     #[test]
     fn test_bch_wallet_invalid_mnemonic() {
-        let result = BchWallet::new("project123", "bad words here", BCH_DERIVATION_PATH, false);
+        let result = BchWallet::new("bad words here", BCH_DERIVATION_PATH, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_watch_id_uses_receiving_address() {
+        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let addr = wallet.get_address_set_at(0).unwrap().receiving;
+        assert!(wallet.watch_id.contains(&addr));
+        assert!(wallet.watch_id.starts_with("watch:mainnet:"));
+    }
+
+    #[test]
+    fn test_chipnet_watch_id_uses_testnet() {
+        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, true).unwrap();
+        assert!(wallet.watch_id.starts_with("watch:testnet:"));
     }
 }

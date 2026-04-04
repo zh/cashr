@@ -52,15 +52,6 @@ pub fn pubkey_to_pkhash(pubkey_hex: &str) -> Result<[u8; 20]> {
     Ok(hash160(&pubkey_bytes))
 }
 
-/// 20-byte pkhash -> Base58Check legacy address (version 0x00).
-/// Used for test cross-verification.
-pub fn pkhash_to_legacy_address(pkhash: &[u8; 20]) -> String {
-    let mut data = Vec::with_capacity(21);
-    data.push(0x00); // version byte
-    data.extend_from_slice(pkhash);
-    bs58::encode(data).with_check().into_string()
-}
-
 /// 20-byte pkhash -> CashAddress (q-prefix for p2pkh).
 pub fn pkhash_to_cashaddr(pkhash: &[u8; 20], chipnet: bool) -> Result<String> {
     let prefix = if chipnet { "bchtest" } else { "bitcoincash" };
@@ -86,26 +77,6 @@ pub fn to_token_address(address: &str) -> Result<String> {
         other => bail!("unknown CashAddress type: {}", other),
     };
     encode_cashaddr(&prefix, new_type, &payload)
-}
-
-/// Re-encode CashAddress with different prefix and/or type.
-pub fn convert_cash_address(address: &str, to_testnet: bool, to_token: bool) -> Result<String> {
-    let (_prefix, addr_type, payload) = decode_cashaddr(address)?;
-    let new_prefix = if to_testnet { "bchtest" } else { "bitcoincash" };
-    let new_type = if to_token {
-        match addr_type {
-            P2PKH | P2PKH_WITH_TOKENS => P2PKH_WITH_TOKENS,
-            P2SH | P2SH_WITH_TOKENS => P2SH_WITH_TOKENS,
-            other => other,
-        }
-    } else {
-        match addr_type {
-            P2PKH | P2PKH_WITH_TOKENS => P2PKH,
-            P2SH | P2SH_WITH_TOKENS => P2SH,
-            other => other,
-        }
-    };
-    encode_cashaddr(new_prefix, new_type, &payload)
 }
 
 // ── CashAddress encoding/decoding ────────────────────────────────────
@@ -339,22 +310,6 @@ mod tests {
         assert_eq!(addr, PAYTACA_MAINNET);
     }
 
-    // ── 5. test_pkhash_to_legacy_address ────────────────────────────
-
-    #[test]
-    fn test_pkhash_to_legacy_address() {
-        // Bitcoin wiki test vector: pubkey -> legacy address
-        let wiki_pubkey = "0250863ad64a87ae8a2fe83c1af1a8403cb53f53e486d8511dad8a04887e5b2352";
-        let pkhash = pubkey_to_pkhash(wiki_pubkey).unwrap();
-        let legacy = pkhash_to_legacy_address(&pkhash);
-        assert_eq!(legacy, "1PMycacnJaSqwwJqjawXBErnLsZ7RkXUAs");
-
-        // Also verify paytaca pubkey produces a valid legacy address (starts with 1)
-        let paytaca_pkhash = pubkey_to_pkhash(PAYTACA_PUBKEY).unwrap();
-        let paytaca_legacy = pkhash_to_legacy_address(&paytaca_pkhash);
-        assert!(paytaca_legacy.starts_with('1'));
-    }
-
     // ── 6. test_pubkey_to_address_mainnet ───────────────────────────
 
     #[test]
@@ -400,18 +355,6 @@ mod tests {
         assert_eq!(result, PAYTACA_TOKEN_CHIPNET);
     }
 
-    // ── 11. test_convert_cash_address_mainnet_to_chipnet ────────────
-
-    #[test]
-    fn test_convert_cash_address_mainnet_to_chipnet() {
-        let converted = convert_cash_address(PAYTACA_MAINNET, true, false).unwrap();
-        assert_eq!(converted, PAYTACA_CHIPNET);
-
-        // And back
-        let back = convert_cash_address(&converted, false, false).unwrap();
-        assert_eq!(back, PAYTACA_MAINNET);
-    }
-
     // ── 12. test_pubkey_to_address_invalid_hex ──────────────────────
 
     #[test]
@@ -433,20 +376,6 @@ mod tests {
     }
 
     // ── Additional coverage ─────────────────────────────────────────
-
-    #[test]
-    fn test_convert_cash_address_to_token_and_testnet() {
-        // Mainnet non-token -> chipnet token
-        let converted = convert_cash_address(PAYTACA_MAINNET, true, true).unwrap();
-        assert_eq!(converted, PAYTACA_TOKEN_CHIPNET);
-    }
-
-    #[test]
-    fn test_convert_cash_address_token_to_non_token() {
-        // Token address -> non-token (strips token type)
-        let converted = convert_cash_address(PAYTACA_TOKEN_MAINNET, false, false).unwrap();
-        assert_eq!(converted, PAYTACA_MAINNET);
-    }
 
     #[test]
     fn test_cashaddr_roundtrip() {

@@ -6,8 +6,8 @@ mod crypto;
 mod network;
 mod storage;
 mod transaction;
+mod types;
 mod wallet;
-mod watchtower;
 mod x402;
 
 #[derive(Parser)]
@@ -198,15 +198,6 @@ enum WalletCommand {
         /// Wallet name to delete
         name: String,
     },
-    /// Re-scan addresses and UTXOs with Watchtower
-    Scan {
-        /// Number of addresses to register (default: 20)
-        #[arg(long, default_value = "10")]
-        count: u32,
-        /// Use chipnet (testnet)
-        #[arg(long)]
-        chipnet: bool,
-    },
     /// Set a wallet as the default
     Default {
         /// Wallet name to set as default
@@ -327,9 +318,6 @@ async fn run() -> Result<()> {
             WalletCommand::Delete { name } => {
                 cli::wallet::delete(&name)?;
             }
-            WalletCommand::Scan { count, chipnet } => {
-                cli::wallet::scan(wallet_name, count, chipnet).await?;
-            }
             WalletCommand::Default { name } => {
                 cli::wallet::set_default(&name)?;
             }
@@ -431,16 +419,16 @@ async fn run() -> Result<()> {
                 vout,
                 chipnet,
             } => {
-                cli::token::send_nft(
+                cli::token::send_nft(cli::token::SendNftArgs {
                     wallet_name,
-                    &address,
-                    &token,
-                    &commitment,
-                    &capability,
-                    txid.as_deref(),
+                    address: &address,
+                    category: &token,
+                    commitment: &commitment,
+                    capability: &capability,
+                    txid: txid.as_deref(),
                     vout,
                     chipnet,
-                )
+                })
                 .await?;
             }
         },
