@@ -17,7 +17,7 @@ A fast, lightweight Bitcoin Cash wallet CLI. Manage BCH, CashTokens (fungible + 
 ### From source
 
 ```bash
-git clone https://github.com/user/cashr.git
+git clone https://github.com/zh/cashr.git
 cd cashr
 cargo install --path .
 ```
