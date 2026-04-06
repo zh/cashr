@@ -124,15 +124,40 @@ pub fn get_mnemonic(name: &str) -> Result<Option<String>> {
     }
 }
 
-/// Delete a wallet file. Clears default if this was the default wallet.
+/// Store the network for a wallet (mainnet or chipnet).
+pub fn store_network(name: &str, chipnet: bool) -> Result<()> {
+    let path = wallets_dir()?.join(format!("{}.net", name));
+    let network = if chipnet { "chipnet" } else { "mainnet" };
+    std::fs::write(&path, network).context("failed to write network file")?;
+    Ok(())
+}
+
+/// Get the network for a wallet. Returns None if not set (legacy wallets default to mainnet).
+pub fn get_network(name: &str) -> Result<Option<bool>> {
+    let path = wallets_dir()?.join(format!("{}.net", name));
+    match std::fs::read_to_string(&path) {
+        Ok(content) => Ok(Some(content.trim() == "chipnet")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context("failed to read network file")),
+    }
+}
+
+/// Delete a wallet file and its network metadata. Clears default if this was the default wallet.
 pub fn delete_wallet(name: &str) -> Result<()> {
     validate_wallet_name(name)?;
-    let path = wallets_dir()?.join(name);
+    let dir = wallets_dir()?;
+
+    // Delete mnemonic file
+    let path = dir.join(name);
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(anyhow::Error::new(e).context("failed to delete wallet file")),
     }
+
+    // Delete network sidecar file
+    let net_path = dir.join(format!("{}.net", name));
+    let _ = std::fs::remove_file(net_path);
 
     // Clear default if this was the default wallet
     if let Ok(Some(default_name)) = get_default_wallet() {
@@ -188,6 +213,10 @@ pub fn list_wallets() -> Result<Vec<String>> {
         let entry = entry?;
         if entry.file_type()?.is_file() {
             if let Some(name) = entry.file_name().to_str() {
+                // Skip metadata sidecar files
+                if name.ends_with(".net") {
+                    continue;
+                }
                 names.push(name.to_string());
             }
         }

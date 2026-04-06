@@ -204,7 +204,11 @@ enum WalletCommand {
         name: String,
     },
     /// List all stored wallets
-    List,
+    List {
+        /// Show chipnet addresses instead of mainnet
+        #[arg(long)]
+        chipnet: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -321,8 +325,8 @@ async fn run() -> Result<()> {
             WalletCommand::Default { name } => {
                 cli::wallet::set_default(&name)?;
             }
-            WalletCommand::List => {
-                cli::wallet::list(wallet_name)?;
+            WalletCommand::List { chipnet } => {
+                cli::wallet::list(wallet_name, chipnet)?;
             }
         },
         Commands::Address { command } => match command {

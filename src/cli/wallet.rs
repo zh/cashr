@@ -12,6 +12,9 @@ pub async fn create(name: &str, chipnet: bool) -> Result<()> {
     let info = wallet::generate_mnemonic(name)
         .context("failed to create wallet")?;
 
+    // Save the network for this wallet
+    let _ = storage::store_network(name, chipnet);
+
     // Display seed phrase with warning
     println!(
         "{}",
@@ -69,6 +72,9 @@ pub async fn import(name: &str, chipnet: bool) -> Result<()> {
 
     let info =
         wallet::import_mnemonic(name, &input).context("failed to import wallet")?;
+
+    // Save the network for this wallet
+    let _ = storage::store_network(name, chipnet);
 
     println!(
         "\n   {}",
@@ -200,7 +206,7 @@ pub fn set_default(name: &str) -> Result<()> {
 }
 
 /// List all stored wallets.
-pub fn list(wallet_name: Option<&str>) -> Result<()> {
+pub fn list(wallet_name: Option<&str>, _chipnet: bool) -> Result<()> {
     let wallets = storage::list_wallets().context("failed to list wallets")?;
 
     if wallets.is_empty() {
@@ -210,7 +216,6 @@ pub fn list(wallet_name: Option<&str>) -> Result<()> {
 
     let default_name = storage::get_default_wallet().unwrap_or(None);
 
-    // The "active" wallet is whichever --name resolves to, or the default
     let active = wallet_name
         .map(|n| n.to_string())
         .or(default_name);
@@ -221,17 +226,23 @@ pub fn list(wallet_name: Option<&str>) -> Result<()> {
         let is_active = active.as_deref() == Some(name.as_str());
         let marker = if is_active { " *" } else { "  " };
 
-        // Derive address at 0 for display
+        // Read stored network (default to mainnet for legacy wallets)
+        let is_chipnet = storage::get_network(name)
+            .unwrap_or(None)
+            .unwrap_or(false);
+        let network_tag = if is_chipnet { "chipnet" } else { "mainnet" };
+
+        // Derive address for the wallet's network
         let addr = wallet::load_wallet(Some(name))
             .ok()
-            .and_then(|w| w.hd_wallet(false).ok())
+            .and_then(|w| w.hd_wallet(is_chipnet).ok())
             .and_then(|hd| hd.get_address_at("0/0", false).ok())
             .unwrap_or_default();
 
         if is_active {
-            println!("   {}{}", marker, name.bold());
+            println!("   {}{} {}", marker, name.bold(), format!("({})", network_tag).dimmed());
         } else {
-            println!("   {}{}", marker, name);
+            println!("   {}{} {}", marker, name, format!("({})", network_tag).dimmed());
         }
         if !addr.is_empty() {
             println!("      {}", addr.dimmed());
