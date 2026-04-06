@@ -3,12 +3,10 @@
 pub const BCH_DERIVATION_PATH: &str = "m/44'/145'/0'";
 
 /// Mainnet Cash REST API base URL.
-pub fn mainnet_api_url(chipnet: bool) -> &'static str {
-    if chipnet {
-        "https://chipnet.rest.bitcoin.com/v5"
-    } else {
-        "https://rest-unstable.mainnet.cash"
-    }
+/// The same server handles both mainnet and chipnet — the network is
+/// determined by the wallet ID format (watch:mainnet: vs watch:testnet:).
+pub fn mainnet_api_url(_chipnet: bool) -> &'static str {
+    "https://rest-unstable.mainnet.cash"
 }
 
 /// Construct a watch-only wallet ID for read operations (no keys exposed).
@@ -50,10 +48,8 @@ mod tests {
 
     #[test]
     fn test_mainnet_api_url_chipnet() {
-        assert_eq!(
-            mainnet_api_url(true),
-            "https://chipnet.rest.bitcoin.com/v5"
-        );
+        // Same server handles both — network determined by wallet ID format
+        assert_eq!(mainnet_api_url(true), "https://rest-unstable.mainnet.cash");
     }
 
     #[test]

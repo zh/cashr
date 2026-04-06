@@ -142,6 +142,19 @@ pub fn get_network(name: &str) -> Result<Option<bool>> {
     }
 }
 
+/// Resolve the network (chipnet or mainnet) for a wallet.
+/// Uses the stored .net file if available, otherwise defaults to mainnet.
+pub fn resolve_chipnet(wallet_name: Option<&str>) -> bool {
+    let name = wallet_name
+        .map(|n| n.to_string())
+        .or_else(|| get_default_wallet().ok().flatten())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return false; // default to mainnet
+    }
+    get_network(&name).unwrap_or(None).unwrap_or(false)
+}
+
 /// Delete a wallet file and its network metadata. Clears default if this was the default wallet.
 pub fn delete_wallet(name: &str) -> Result<()> {
     validate_wallet_name(name)?;

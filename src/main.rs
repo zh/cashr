@@ -305,6 +305,10 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     let wallet_name = cli.name.as_deref();
 
+    // Auto-detect network from wallet's stored .net file.
+    // If --chipnet is explicitly passed, it overrides the stored value.
+    let auto_chipnet = crate::storage::resolve_chipnet(wallet_name);
+
     match cli.command {
         Commands::Wallet { command } => match command {
             WalletCommand::Create { name, chipnet } => {
@@ -314,7 +318,7 @@ async fn run() -> Result<()> {
                 cli::wallet::import(&name, chipnet).await?;
             }
             WalletCommand::Info { chipnet } => {
-                cli::wallet::info(wallet_name, chipnet).await?;
+                cli::wallet::info(wallet_name, chipnet || auto_chipnet).await?;
             }
             WalletCommand::Export => {
                 cli::wallet::export(wallet_name)?;
@@ -326,7 +330,7 @@ async fn run() -> Result<()> {
                 cli::wallet::set_default(&name)?;
             }
             WalletCommand::List { chipnet } => {
-                cli::wallet::list(wallet_name, chipnet)?;
+                cli::wallet::list(wallet_name, chipnet || auto_chipnet)?;
             }
         },
         Commands::Address { command } => match command {
@@ -335,14 +339,14 @@ async fn run() -> Result<()> {
                 chipnet,
                 token,
             } => {
-                cli::address::derive(wallet_name, index, chipnet, token)?;
+                cli::address::derive(wallet_name, index, chipnet || auto_chipnet, token)?;
             }
             AddressCommand::List {
                 count,
                 chipnet,
                 token,
             } => {
-                cli::address::list(wallet_name, count, chipnet, token)?;
+                cli::address::list(wallet_name, count, chipnet || auto_chipnet, token)?;
             }
         },
         Commands::Balance {
@@ -350,7 +354,7 @@ async fn run() -> Result<()> {
             token,
             sats,
         } => {
-            cli::balance::run(wallet_name, chipnet, token.as_deref(), sats).await?;
+            cli::balance::run(wallet_name, chipnet || auto_chipnet, token.as_deref(), sats).await?;
         }
         Commands::Send {
             address,
@@ -358,10 +362,10 @@ async fn run() -> Result<()> {
             unit,
             chipnet,
         } => {
-            cli::send::run(wallet_name, &address, &amount, &unit, chipnet).await?;
+            cli::send::run(wallet_name, &address, &amount, &unit, chipnet || auto_chipnet).await?;
         }
         Commands::SendAll { address, chipnet } => {
-            cli::send::run_send_all(wallet_name, &address, chipnet).await?;
+            cli::send::run_send_all(wallet_name, &address, chipnet || auto_chipnet).await?;
         }
         Commands::Receive {
             index,
@@ -374,7 +378,7 @@ async fn run() -> Result<()> {
             cli::receive::run(
                 wallet_name,
                 index,
-                chipnet,
+                chipnet || auto_chipnet,
                 token.as_deref(),
                 amount.as_deref(),
                 &unit,
@@ -391,7 +395,7 @@ async fn run() -> Result<()> {
         } => {
             cli::history::run(
                 wallet_name,
-                chipnet,
+                chipnet || auto_chipnet,
                 page,
                 &record_type,
                 token.as_deref(),
@@ -401,10 +405,10 @@ async fn run() -> Result<()> {
         }
         Commands::Token { command } => match command {
             TokenCommand::List { chipnet } => {
-                cli::token::list(wallet_name, chipnet).await?;
+                cli::token::list(wallet_name, chipnet || auto_chipnet).await?;
             }
             TokenCommand::Info { category, chipnet } => {
-                cli::token::info(wallet_name, &category, chipnet).await?;
+                cli::token::info(wallet_name, &category, chipnet || auto_chipnet).await?;
             }
             TokenCommand::Send {
                 address,
@@ -412,7 +416,7 @@ async fn run() -> Result<()> {
                 token,
                 chipnet,
             } => {
-                cli::token::send(wallet_name, &address, &amount, &token, chipnet).await?;
+                cli::token::send(wallet_name, &address, &amount, &token, chipnet || auto_chipnet).await?;
             }
             TokenCommand::SendNft {
                 address,
@@ -431,7 +435,7 @@ async fn run() -> Result<()> {
                     capability: &capability,
                     txid: txid.as_deref(),
                     vout,
-                    chipnet,
+                    chipnet: chipnet || auto_chipnet,
                 })
                 .await?;
             }
@@ -455,7 +459,7 @@ async fn run() -> Result<()> {
                 &method,
                 &headers,
                 body.as_deref(),
-                chipnet,
+                chipnet || auto_chipnet,
                 max_amount,
                 change_address.as_deref(),
                 payer,
@@ -479,7 +483,7 @@ async fn run() -> Result<()> {
                 &method,
                 &headers,
                 body.as_deref(),
-                chipnet,
+                chipnet || auto_chipnet,
                 json,
             )
             .await?;
