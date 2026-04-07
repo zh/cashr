@@ -5,7 +5,7 @@ pub mod bch;
 use anyhow::{bail, Result};
 use getrandom::getrandom;
 
-use crate::network::BCH_DERIVATION_PATH;
+use crate::network::{self, BCH_DERIVATION_PATH};
 use crate::storage;
 use keys::{compute_wallet_hash, HdWallet};
 use bch::BchWallet;
@@ -37,7 +37,9 @@ pub struct Wallet {
 impl Wallet {
     /// Get a BchWallet for the given network.
     pub fn for_network(&self, chipnet: bool) -> Result<BchWallet> {
-        BchWallet::new(&self.mnemonic, BCH_DERIVATION_PATH, chipnet)
+        let pid = network::project_id();
+        let project_id = if chipnet { &pid.chipnet } else { &pid.mainnet };
+        BchWallet::new(project_id, &self.mnemonic, BCH_DERIVATION_PATH, chipnet)
     }
 
     /// Get an HdWallet for the given network.

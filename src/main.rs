@@ -9,6 +9,7 @@ mod storage;
 mod transaction;
 mod types;
 mod wallet;
+mod watchtower;
 mod x402;
 
 #[derive(Parser)]

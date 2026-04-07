@@ -12,6 +12,7 @@ pub async fn list(wallet_name: Option<&str>, chipnet: bool, verbose: bool) -> Re
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
+    bch.ensure_synced(5).await?;
 
     println!(
         "\n   {}\n",
@@ -107,26 +108,21 @@ pub async fn list(wallet_name: Option<&str>, chipnet: bool, verbose: bool) -> Re
     );
 
     if verbose {
-        let addr_balances = bch
-            .get_address_token_balances()
-            .await
-            .context("failed to fetch per-address token balances")?;
-        if !addr_balances.is_empty() {
-            println!("\n   {}\n", "Per-address breakdown:".dimmed());
-            for (path, addr, cats) in &addr_balances {
-                println!(
-                    "   {}  {}",
-                    format!("m/44'/145'/0'/{}", path).dimmed(),
-                    addr.dimmed()
-                );
-                for (cat, amount) in cats {
-                    println!(
-                        "      {} {}",
-                        *amount as u64,
-                        short_hex(cat, 8).dimmed()
-                    );
-                }
-            }
+        // Show derived addresses (receiving + token)
+        println!("\n   {}\n", "Derived addresses:".dimmed());
+        for i in 0..5u32 {
+            let addr = bch.get_address_set_at(i)?;
+            let token_addr = bch.get_token_address_set_at(i)?;
+            println!(
+                "   {}  {}",
+                format!("0/{}", i).dimmed(),
+                addr.receiving.dimmed()
+            );
+            println!(
+                "   {}  {}",
+                format!("0/{} (token)", i).dimmed(),
+                token_addr.receiving.dimmed()
+            );
         }
     }
 
@@ -244,6 +240,7 @@ pub async fn send(
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
+    bch.ensure_synced(5).await?;
 
     // Token change goes to our token address
     let token_change = bch.get_token_address_set_at(0)?.change;
@@ -341,6 +338,7 @@ pub async fn send_nft(args: SendNftArgs<'_>) -> Result<()> {
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
+    bch.ensure_synced(5).await?;
 
     // Resolve UTXO: either from flags or auto-detect
     let (resolved_txid, resolved_vout) = match (txid, vout) {

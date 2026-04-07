@@ -1,5 +1,4 @@
 /// Shared CLI utility functions.
-
 /// Convert BCH to satoshis.
 pub fn bch_to_sats(bch: f64) -> i64 {
     (bch * 1e8).round() as i64

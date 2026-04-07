@@ -2,24 +2,32 @@
 /// BIP44 derivation path for BCH (coin type 145)
 pub const BCH_DERIVATION_PATH: &str = "m/44'/145'/0'";
 
-/// Mainnet Cash REST API base URL.
-/// The same server handles both mainnet and chipnet — the network is
-/// determined by the wallet ID format (watch:mainnet: vs watch:testnet:).
-pub fn mainnet_api_url(_chipnet: bool) -> &'static str {
-    "https://rest-unstable.mainnet.cash"
+/// Watchtower project IDs from environment variables.
+pub struct ProjectId {
+    pub mainnet: String,
+    pub chipnet: String,
 }
 
-/// Construct a watch-only wallet ID for read operations (no keys exposed).
-pub fn watch_wallet_id(chipnet: bool, cashaddr: &str) -> String {
-    let network = if chipnet { "testnet" } else { "mainnet" };
-    format!("watch:{}:{}", network, cashaddr)
+/// Default Paytaca project IDs on Watchtower (public, from watchtower.cash/api/projects/).
+const DEFAULT_MAINNET_PROJECT_ID: &str = "5348e8fd-c001-47c7-b97c-807f545cf44e";
+const DEFAULT_CHIPNET_PROJECT_ID: &str = "5348e8fd-c001-47c7-b97c-807f545cf44e";
+
+/// Read Watchtower project IDs from environment, falling back to Paytaca defaults.
+pub fn project_id() -> ProjectId {
+    ProjectId {
+        mainnet: std::env::var("WATCHTOWER_PROJECT_ID")
+            .unwrap_or_else(|_| DEFAULT_MAINNET_PROJECT_ID.to_string()),
+        chipnet: std::env::var("WATCHTOWER_CHIP_PROJECT_ID")
+            .unwrap_or_else(|_| DEFAULT_CHIPNET_PROJECT_ID.to_string()),
+    }
 }
 
-/// Create a mainnet API configuration.
-pub fn mainnet_config(chipnet: bool) -> mainnet::apis::configuration::Configuration {
-    mainnet::apis::configuration::Configuration {
-        base_path: mainnet_api_url(chipnet).to_string(),
-        ..Default::default()
+/// Watchtower REST API base URL.
+pub fn watchtower_api_url(chipnet: bool) -> &'static str {
+    if chipnet {
+        "https://chipnet.watchtower.cash/api"
+    } else {
+        "https://watchtower.cash/api"
     }
 }
 
@@ -42,32 +50,16 @@ mod tests {
     }
 
     #[test]
-    fn test_mainnet_api_url_mainnet() {
-        assert_eq!(mainnet_api_url(false), "https://rest-unstable.mainnet.cash");
+    fn test_watchtower_api_url_mainnet() {
+        assert_eq!(watchtower_api_url(false), "https://watchtower.cash/api");
     }
 
     #[test]
-    fn test_mainnet_api_url_chipnet() {
-        // Same server handles both — network determined by wallet ID format
-        assert_eq!(mainnet_api_url(true), "https://rest-unstable.mainnet.cash");
-    }
-
-    #[test]
-    fn test_watch_wallet_id_mainnet() {
-        let id = watch_wallet_id(false, "bitcoincash:qtest");
-        assert_eq!(id, "watch:mainnet:bitcoincash:qtest");
-    }
-
-    #[test]
-    fn test_watch_wallet_id_chipnet() {
-        let id = watch_wallet_id(true, "bchtest:qtest");
-        assert_eq!(id, "watch:testnet:bchtest:qtest");
-    }
-
-    #[test]
-    fn test_mainnet_config_base_path() {
-        let cfg = mainnet_config(false);
-        assert_eq!(cfg.base_path, "https://rest-unstable.mainnet.cash");
+    fn test_watchtower_api_url_chipnet() {
+        assert_eq!(
+            watchtower_api_url(true),
+            "https://chipnet.watchtower.cash/api"
+        );
     }
 
     #[test]

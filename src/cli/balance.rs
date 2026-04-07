@@ -16,6 +16,7 @@ pub async fn run(
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
     let bch = w.for_network(chipnet)?;
+    bch.ensure_synced(5).await?;
 
     if let Some(tid) = token_id {
         // Validate hex format
@@ -117,19 +118,24 @@ pub async fn run(
         }
 
         if verbose {
-            let addr_balances = bch
-                .get_address_balances()
+            let utxos = bch
+                .get_bch_utxos()
                 .await
-                .context("failed to fetch address balances")?;
-            if !addr_balances.is_empty() {
+                .context("failed to fetch UTXOs for verbose output")?;
+            if !utxos.is_empty() {
+                let mut by_path: std::collections::BTreeMap<String, u64> =
+                    std::collections::BTreeMap::new();
+                for u in &utxos {
+                    *by_path.entry(u.address_path.clone()).or_insert(0) += u.value;
+                }
                 println!("\n   {}\n", "Per-address breakdown:".dimmed());
-                for (path, addr, sats) in &addr_balances {
-                    let bch_val = sats / 1e8;
+                for (path, sats) in &by_path {
+                    let bch_val = *sats as f64 / 1e8;
                     println!(
-                        "   {}  {} BCH  {}",
+                        "   {}  {} BCH  ({} sats)",
                         format!("m/44'/145'/0'/{}", path).dimmed(),
                         bch_val,
-                        addr.dimmed()
+                        format_sats(*sats as i64).dimmed()
                     );
                 }
             }
