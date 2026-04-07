@@ -224,11 +224,12 @@ cashr pay https://api.example.com/resource --json --confirmed
 
 ### Security Model
 
-cashr uses a hybrid architecture that keeps your private keys local:
+cashr keeps your private keys local:
 
-- **Read operations** (balance, UTXOs, history, tokens) — use `watch:` wallet IDs that expose only the public address
+- **Read operations** (balance, UTXOs, tokens) — queried via local electrumx server or remote REST API
+- **Token metadata** (name, symbol, decimals) — fetched from Watchtower / Paytaca BCMR registries
 - **Transaction signing** — done locally using your HD wallet keys
-- **Broadcast** — signed raw transaction hex sent to the REST API for broadcast
+- **Broadcast** — signed raw transaction hex sent via electrumx or REST API
 - **Key material** — stored in `~/.cashr/wallets/` with 0600 permissions, never sent to any server
 
 ### How It Works
@@ -238,15 +239,18 @@ cashr uses a hybrid architecture that keeps your private keys local:
                   │  cashr CLI  │
                   └──────┬──────┘
                          │
-            ┌────────────┼────────────┐
-            │            │            │
-     Local HD Wallet   REST API    Broadcast
-     (key derivation)  (read-only)  (raw hex)
-     (tx signing)      (balance)
-     (tx building)     (UTXOs)
-                       (history)
-                       (tokens)
+         ┌───────────────┼───────────────┐
+         │               │               │
+  Local HD Wallet    Electrumx       External
+  (key derivation)   (balance)       (history → REST)
+  (tx signing)       (UTXOs)         (token names → BCMR)
+  (tx building)      (CashTokens)
+                     (broadcast)
 ```
+
+When a local [fulcrum-rust](https://github.com/user/fulcrum-rust) server is configured, cashr uses it for all balance, UTXO, CashToken, and broadcast operations via Electrum protocol 1.5. The mainnet-cash REST API is only used for transaction history (connected lazily on first `cashr history` call). Token metadata (name, symbol, decimals) is fetched from Watchtower and Paytaca BCMR registries.
+
+Without electrumx configured, all operations fall back to the mainnet-cash REST API.
 
 ### Wallet Storage
 
@@ -256,11 +260,14 @@ cashr uses a hybrid architecture that keeps your private keys local:
     mywallet          # 12-word mnemonic (plaintext, 0600 perms)
     mywallet.net      # network: "mainnet" or "chipnet"
     default           # name of the default wallet
+  servers.toml        # optional: server configuration
 ```
 
 ### Dependencies
 
-- **[mainnet-cash](https://rest-unstable.mainnet.cash)** — REST API for blockchain queries and broadcast ([generated Rust client](https://github.com/zh/mainnet-rust-generated) from OpenAPI spec)
+- **[fulcrum-rust](https://github.com/user/fulcrum-rust)** — local Electrum REST gateway with CashToken support (protocol 1.5)
+- **[mainnet-cash](https://rest-unstable.mainnet.cash)** — REST API fallback for transaction history
+- **Watchtower / Paytaca BCMR** — token metadata registries
 - Local transaction building with `secp256k1` + `SIGHASH_FORKID`
 - BIP39/BIP32/BIP44 HD wallet derivation
 - CashToken prefix encoding (CHIP-2022-02)
@@ -273,9 +280,22 @@ cashr uses a hybrid architecture that keeps your private keys local:
 |----------|-------------|---------|
 | `CASHR_HOME` | Wallet storage directory | `~/.cashr` |
 
-### REST API
+### Server Configuration
 
-cashr connects to `https://rest-unstable.mainnet.cash` for blockchain operations. The same server handles both mainnet and chipnet — the network is determined by the wallet ID format.
+Create `~/.cashr/servers.toml` to configure backends:
+
+```toml
+[electrumx]
+# Local fulcrum-rust instances (tried in order, first success wins)
+mainnet = ["http://localhost:3001"]
+chipnet = ["http://localhost:3002"]
+
+[rest]
+# Mainnet-cash REST API (only used for transaction history)
+servers = ["https://rest-unstable.mainnet.cash"]
+```
+
+Without this file, cashr falls back to the mainnet-cash REST API for all operations.
 
 ## License
 
