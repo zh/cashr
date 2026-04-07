@@ -6,9 +6,11 @@
 /// - Key material NEVER leaves the machine
 use anyhow::{Context, Result};
 
+use crate::bcmr::BcmrClient;
 use crate::constants::{
     DEFAULT_FEE_RATE, DEFAULT_PAGE_SIZE, FEE_RESERVE_SATS, MAX_CONCURRENT_REQUESTS, SATS_PER_BCH,
 };
+use crate::electrumx::ElectrumxClient;
 use crate::network;
 use crate::transaction;
 use crate::types::{
@@ -31,19 +33,29 @@ fn extract_lacking_sats(err_msg: &str) -> Option<u64> {
 /// Keep low to minimize API calls — most wallets only use index 0.
 const ADDRESS_SCAN_COUNT: u32 = 2;
 
-/// (watch_ids, bch_watch_ids, token_watch_ids, watch_paths)
+/// (watch_ids, bch_watch_ids, token_watch_ids, watch_paths, bch_addresses)
 type WatchIdSets = (
     Vec<String>,
     Vec<String>,
     Vec<String>,
     std::collections::HashMap<String, String>,
+    Vec<(String, String)>,
 );
 
-/// Core BCH wallet combining local key derivation with Mainnet Cash REST API.
+/// Core BCH wallet combining local key derivation with electrumx backend
+/// for BCH + CashToken operations, BCMR for token metadata, and lazy
+/// mainnet-cash REST fallback for history only.
 pub struct BchWallet {
     wallet_hash: String,
     hd_wallet: HdWallet,
-    api_config: mainnet::apis::configuration::Configuration,
+    /// Lazy REST config — only connects when `get_history()` is called.
+    rest_config: tokio::sync::OnceCell<mainnet::apis::configuration::Configuration>,
+    chipnet: bool,
+    /// Electrumx client for BCH + CashToken operations.
+    /// None when no electrumx servers are configured — falls back to REST.
+    electrumx: Option<ElectrumxClient>,
+    /// BCMR metadata client (Watchtower → Paytaca fallback).
+    bcmr: BcmrClient,
     /// Watch wallet IDs for all tracked addresses (receiving + change + token addresses).
     watch_ids: Vec<String>,
     /// Watch wallet IDs for regular (q-prefix) addresses only — for BCH operations.
@@ -52,6 +64,8 @@ pub struct BchWallet {
     token_watch_ids: Vec<String>,
     /// Address path mapping: watch_id -> address_path (e.g. "0/0", "1/3")
     watch_paths: std::collections::HashMap<String, String>,
+    /// Plain cashaddrs for BCH addresses (q-prefix), used by electrumx client.
+    bch_addresses: Vec<(String, String)>,
 }
 
 /// Options for fetching transaction history.
@@ -77,22 +91,53 @@ impl BchWallet {
     ///
     /// Derives watch IDs for ADDRESS_SCAN_COUNT address indices. The actual number
     /// of indices actively queried can be reduced at runtime via `discover_active_indices()`.
-    pub fn new(mnemonic: &str, path: &str, chipnet: bool) -> Result<Self> {
+    pub async fn new(mnemonic: &str, path: &str, chipnet: bool) -> Result<Self> {
         let hd_wallet = HdWallet::new(mnemonic, path, chipnet)?;
         let wallet_hash = hd_wallet.wallet_hash().to_string();
-        let api_config = network::mainnet_config(chipnet);
 
-        let (watch_ids, bch_watch_ids, token_watch_ids, watch_paths) =
+        // Connect electrumx with failover (REST is lazy — only for history)
+        let electrumx = network::connect_electrumx(chipnet).await?;
+        let bcmr = BcmrClient::new(chipnet);
+
+        let (watch_ids, bch_watch_ids, token_watch_ids, watch_paths, bch_addresses) =
             Self::build_watch_ids(&hd_wallet, chipnet, ADDRESS_SCAN_COUNT)?;
 
         Ok(Self {
             wallet_hash,
             hd_wallet,
-            api_config,
+            rest_config: tokio::sync::OnceCell::new(),
+            chipnet,
+            electrumx,
+            bcmr,
             watch_ids,
             bch_watch_ids,
             token_watch_ids,
             watch_paths,
+            bch_addresses,
+        })
+    }
+
+    /// Create a BchWallet without connecting to any server (for tests and offline ops).
+    #[cfg(test)]
+    pub fn new_offline(mnemonic: &str, path: &str, chipnet: bool) -> Result<Self> {
+        let hd_wallet = HdWallet::new(mnemonic, path, chipnet)?;
+        let wallet_hash = hd_wallet.wallet_hash().to_string();
+
+        let (watch_ids, bch_watch_ids, token_watch_ids, watch_paths, bch_addresses) =
+            Self::build_watch_ids(&hd_wallet, chipnet, ADDRESS_SCAN_COUNT)?;
+
+        Ok(Self {
+            wallet_hash,
+            hd_wallet,
+            rest_config: tokio::sync::OnceCell::new(),
+            chipnet,
+            electrumx: None,
+            bcmr: BcmrClient::new(chipnet),
+            watch_ids,
+            bch_watch_ids,
+            token_watch_ids,
+            watch_paths,
+            bch_addresses,
         })
     }
 
@@ -109,6 +154,7 @@ impl BchWallet {
         let mut bch_watch_ids = Vec::new();
         let mut token_watch_ids = Vec::new();
         let mut watch_paths = std::collections::HashMap::new();
+        let mut bch_addresses = Vec::new();
         for i in 0..count {
             let addrs = hd_wallet.get_address_set_at(i)?;
             let token_addrs = hd_wallet.get_token_address_set_at(i)?;
@@ -122,6 +168,7 @@ impl BchWallet {
                 if let std::collections::hash_map::Entry::Vacant(e) = watch_paths.entry(wid.clone()) {
                     watch_ids.push(wid.clone());
                     bch_watch_ids.push(wid);
+                    bch_addresses.push((addr.clone(), addr_path.clone()));
                     e.insert(addr_path);
                 }
             }
@@ -139,7 +186,7 @@ impl BchWallet {
                 }
             }
         }
-        Ok((watch_ids, bch_watch_ids, token_watch_ids, watch_paths))
+        Ok((watch_ids, bch_watch_ids, token_watch_ids, watch_paths, bch_addresses))
     }
 
     /// Derive receiving + change addresses at index (delegates to HdWallet).
@@ -154,13 +201,40 @@ impl BchWallet {
 
     // ── Read operations (watch wallet ID -- no keys exposed) ────────
 
-    /// Get wallet BCH balance via Mainnet Cash API (chunked parallel requests).
+    /// Get wallet BCH balance (electrumx when available, REST fallback).
     pub async fn get_balance(&self) -> Result<BalanceResponse> {
+        if let Some(ref ex) = self.electrumx {
+            return self.get_balance_electrumx(ex).await;
+        }
+        self.get_balance_rest().await
+    }
+
+    async fn get_balance_electrumx(&self, ex: &ElectrumxClient) -> Result<BalanceResponse> {
+        let mut total_sats: i64 = 0;
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, _)| ex.get_balance(addr))
+                .collect();
+            for (confirmed, unconfirmed) in futures::future::join_all(futures).await.into_iter().flatten() {
+                total_sats += confirmed + unconfirmed;
+            }
+        }
+        Ok(BalanceResponse {
+            valid: true,
+            wallet: self.wallet_hash.clone(),
+            balance: total_sats as f64 / SATS_PER_BCH,
+            spendable: total_sats as f64 / SATS_PER_BCH,
+        })
+    }
+
+    async fn get_balance_rest(&self) -> Result<BalanceResponse> {
+        let config = self.rest_config().await?;
         let mut all_results = Vec::new();
         for chunk in self.bch_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 mainnet::apis::wallet_api::balance(
-                    &self.api_config,
+                    config,
                     mainnet::models::BalanceRequest {
                         wallet_id: wid.clone(),
                         slp_semi_aware: None,
@@ -186,13 +260,50 @@ impl BchWallet {
 
     /// Get per-address BCH balances (for verbose/debug output).
     pub async fn get_address_balances(&self) -> Result<Vec<(String, String, f64)>> {
+        if let Some(ref ex) = self.electrumx {
+            return self.get_address_balances_electrumx(ex).await;
+        }
+        self.get_address_balances_rest().await
+    }
+
+    async fn get_address_balances_electrumx(
+        &self,
+        ex: &ElectrumxClient,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let mut balances = Vec::new();
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, path)| {
+                    let addr = addr.clone();
+                    let path = path.clone();
+                    async move {
+                        let result = ex.get_balance(&addr).await;
+                        (path, addr, result)
+                    }
+                })
+                .collect();
+            for (path, addr, result) in futures::future::join_all(futures).await {
+                if let Ok((confirmed, unconfirmed)) = result {
+                    let sats = (confirmed + unconfirmed) as f64;
+                    if sats > 0.0 {
+                        balances.push((path, addr, sats));
+                    }
+                }
+            }
+        }
+        Ok(balances)
+    }
+
+    async fn get_address_balances_rest(&self) -> Result<Vec<(String, String, f64)>> {
+        let config = self.rest_config().await?;
         let mut results = Vec::new();
         for chunk in self.bch_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 let wid = wid.clone();
                 async move {
                     let resp = mainnet::apis::wallet_api::balance(
-                        &self.api_config,
+                        config,
                         mainnet::models::BalanceRequest {
                             wallet_id: wid.clone(),
                             slp_semi_aware: None,
@@ -213,7 +324,6 @@ impl BchWallet {
                 .unwrap_or(0.0);
             if sats > 0.0 {
                 let path = self.watch_paths.get(&wid).cloned().unwrap_or_default();
-                // Extract the cashaddr from the watch_id (format: "watch:{network}:{addr}")
                 let addr = wid.splitn(3, ':').nth(2).unwrap_or(&wid).to_string();
                 balances.push((path, addr, sats));
             }
@@ -221,13 +331,59 @@ impl BchWallet {
         Ok(balances)
     }
 
+    /// Lazy REST config — connects on first call (only needed for history).
+    async fn rest_config(
+        &self,
+    ) -> Result<&mainnet::apis::configuration::Configuration> {
+        self.rest_config
+            .get_or_try_init(|| async { network::connect_rest(self.chipnet).await })
+            .await
+    }
+
     /// Get token balance for a specific category (across all token addresses).
     pub async fn get_token_balance(&self, category: &str) -> Result<BalanceResponse> {
+        if let Some(ref ex) = self.electrumx {
+            return self.get_token_balance_electrumx(ex, category).await;
+        }
+        self.get_token_balance_rest(category).await
+    }
+
+    async fn get_token_balance_electrumx(
+        &self,
+        ex: &ElectrumxClient,
+        category: &str,
+    ) -> Result<BalanceResponse> {
+        let mut total: f64 = 0.0;
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, _)| ex.get_all_utxos(addr))
+                .collect();
+            for result in futures::future::join_all(futures).await.into_iter().flatten() {
+                for u in result {
+                    if let Some(ref td) = u.token_data {
+                        if td.category == category {
+                            total += td.amount.parse::<f64>().unwrap_or(0.0);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(BalanceResponse {
+            valid: true,
+            wallet: self.wallet_hash.clone(),
+            balance: total,
+            spendable: total,
+        })
+    }
+
+    async fn get_token_balance_rest(&self, category: &str) -> Result<BalanceResponse> {
+        let config = self.rest_config().await?;
         let mut all_results = Vec::new();
         for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 mainnet::apis::wallet_api::get_token_balance(
-                    &self.api_config,
+                    config,
                     mainnet::models::GetTokenBalanceRequest {
                         wallet_id: wid.clone(),
                         category: category.to_string(),
@@ -249,15 +405,54 @@ impl BchWallet {
         })
     }
 
-    /// Get BCH (non-token) UTXOs via Mainnet Cash API (chunked parallel requests).
+    /// Get BCH (non-token) UTXOs (electrumx when available, REST fallback).
     pub async fn get_bch_utxos(&self) -> Result<Vec<transaction::Utxo>> {
+        if let Some(ref ex) = self.electrumx {
+            return self.get_bch_utxos_electrumx(ex).await;
+        }
+        self.get_bch_utxos_rest().await
+    }
+
+    async fn get_bch_utxos_electrumx(&self, ex: &ElectrumxClient) -> Result<Vec<transaction::Utxo>> {
+        let mut result = Vec::new();
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, path)| {
+                    let addr = addr.clone();
+                    let path = path.clone();
+                    async move {
+                        let utxos = ex.get_utxos(&addr).await;
+                        (path, utxos)
+                    }
+                })
+                .collect();
+            for (addr_path, utxos) in futures::future::join_all(futures).await {
+                let Ok(utxos) = utxos else { continue };
+                for u in utxos {
+                    if u.value < 546 { continue; }
+                    result.push(transaction::Utxo {
+                        txid: u.txid,
+                        vout: u.vout,
+                        value: u.value,
+                        address_path: addr_path.clone(),
+                        token: None,
+                    });
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_bch_utxos_rest(&self) -> Result<Vec<transaction::Utxo>> {
+        let config = self.rest_config().await?;
         let mut results = Vec::new();
         for chunk in self.watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 let watch = serde_json::json!({ "walletId": wid });
                 let wid = wid.clone();
                 async move {
-                    let utxos = mainnet::apis::wallet_api::utxos(&self.api_config, watch).await.ok();
+                    let utxos = mainnet::apis::wallet_api::utxos(config, watch).await.ok();
                     (wid, utxos)
                 }
             }).collect();
@@ -283,8 +478,51 @@ impl BchWallet {
         Ok(result)
     }
 
-    /// Get CashToken UTXOs for a specific category (chunked parallel requests).
+    /// Get CashToken UTXOs for a specific category.
     pub async fn get_cashtoken_utxos(&self, category: &str) -> Result<Vec<CashTokenUtxo>> {
+        if let Some(ref ex) = self.electrumx {
+            return self.get_cashtoken_utxos_electrumx(ex, category).await;
+        }
+        self.get_cashtoken_utxos_rest(category).await
+    }
+
+    async fn get_cashtoken_utxos_electrumx(
+        &self,
+        ex: &ElectrumxClient,
+        category: &str,
+    ) -> Result<Vec<CashTokenUtxo>> {
+        let mut utxos = Vec::new();
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, path)| {
+                    let addr = addr.clone();
+                    let path = path.clone();
+                    async move { (path, ex.get_all_utxos(&addr).await) }
+                })
+                .collect();
+            for (addr_path, result) in futures::future::join_all(futures).await {
+                let Ok(all_utxos) = result else { continue };
+                for u in all_utxos {
+                    let Some(ref td) = u.token_data else { continue };
+                    if td.category != category { continue; }
+                    let token_amount = td.amount.parse::<u64>().unwrap_or(0);
+                    let (commitment, capability) = match &td.nft {
+                        Some(nft) => (nft.commitment.clone(), Some(nft.capability.clone())),
+                        None => (String::new(), None),
+                    };
+                    utxos.push(CashTokenUtxo {
+                        txid: u.txid, vout: u.vout, value: u.value,
+                        address_path: addr_path.clone(), token_amount, commitment, capability,
+                    });
+                }
+            }
+        }
+        Ok(utxos)
+    }
+
+    async fn get_cashtoken_utxos_rest(&self, category: &str) -> Result<Vec<CashTokenUtxo>> {
+        let config = self.rest_config().await?;
         let mut results = Vec::new();
         for chunk in self.watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
@@ -292,7 +530,7 @@ impl BchWallet {
                 let cat = category.to_string();
                 async move {
                     let resp = mainnet::apis::wallet_api::get_token_utxos(
-                        &self.api_config,
+                        config,
                         mainnet::models::GetTokenUtxosRequest {
                             wallet_id: wid.clone(),
                             category: Some(Some(cat)),
@@ -335,10 +573,37 @@ impl BchWallet {
         Ok(utxos)
     }
 
-    /// Broadcast a raw transaction hex via Mainnet Cash API.
+    /// Broadcast a raw transaction hex (electrumx when available, REST fallback).
     pub async fn broadcast(&self, tx_hex: &str) -> Result<BroadcastResult> {
+        if let Some(ref ex) = self.electrumx {
+            return self.broadcast_electrumx(ex, tx_hex).await;
+        }
+        self.broadcast_rest(tx_hex).await
+    }
+
+    async fn broadcast_electrumx(
+        &self,
+        ex: &ElectrumxClient,
+        tx_hex: &str,
+    ) -> Result<BroadcastResult> {
+        match ex.broadcast(tx_hex).await {
+            Ok(txid) => Ok(BroadcastResult {
+                txid: Some(txid),
+                success: true,
+                error: None,
+            }),
+            Err(e) => Ok(BroadcastResult {
+                txid: None,
+                success: false,
+                error: Some(format!("{:?}", e)),
+            }),
+        }
+    }
+
+    async fn broadcast_rest(&self, tx_hex: &str) -> Result<BroadcastResult> {
+        let config = self.rest_config().await?;
         let resp = mainnet::apis::wallet_api::submit_transaction(
-            &self.api_config,
+            config,
             mainnet::models::SubmitTransactionRequest {
                 wallet_id: self.watch_ids[0].clone(),
                 transaction_hex: tx_hex.to_string(),
@@ -361,8 +626,9 @@ impl BchWallet {
         }
     }
 
-    /// Get transaction history via Mainnet Cash API.
+    /// Get transaction history via Mainnet Cash REST API (lazy connection).
     pub async fn get_history(&self, opts: HistoryOptions) -> Result<HistoryResponse> {
+        let config = self.rest_config().await?;
         // Query all tracked addresses in parallel, then merge & deduplicate.
         let page_size: usize = DEFAULT_PAGE_SIZE;
         // Fetch enough from each address to fill the requested page after merging.
@@ -378,7 +644,7 @@ impl BchWallet {
         for chunk in ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 mainnet::apis::wallet_api::get_history(
-                    &self.api_config,
+                    config,
                     mainnet::models::HistoryRequest {
                         wallet_id: wid.clone(),
                         unit: Some(mainnet::models::history_request::Unit::Sat),
@@ -549,13 +815,60 @@ impl BchWallet {
     pub async fn get_address_token_balances(
         &self,
     ) -> Result<Vec<(String, String, std::collections::HashMap<String, f64>)>> {
+        if let Some(ref ex) = self.electrumx {
+            return self.get_address_token_balances_electrumx(ex).await;
+        }
+        self.get_address_token_balances_rest().await
+    }
+
+    async fn get_address_token_balances_electrumx(
+        &self,
+        ex: &ElectrumxClient,
+    ) -> Result<Vec<(String, String, std::collections::HashMap<String, f64>)>> {
+        let mut out = Vec::new();
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, path)| {
+                    let addr = addr.clone();
+                    let path = path.clone();
+                    async move {
+                        let result = ex.get_all_utxos(&addr).await;
+                        (path, addr, result)
+                    }
+                })
+                .collect();
+            for (path, addr, result) in futures::future::join_all(futures).await {
+                let Ok(utxos) = result else { continue };
+                let mut balances: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for u in utxos {
+                    if let Some(ref td) = u.token_data {
+                        let amt = td.amount.parse::<f64>().unwrap_or(0.0);
+                        if amt > 0.0 {
+                            *balances.entry(td.category.clone()).or_insert(0.0) += amt;
+                        }
+                    }
+                }
+                if !balances.is_empty() {
+                    out.push((path, addr, balances));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_address_token_balances_rest(
+        &self,
+    ) -> Result<Vec<(String, String, std::collections::HashMap<String, f64>)>> {
+        let config = self.rest_config().await?;
         let mut results = Vec::new();
         for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 let wid = wid.clone();
                 async move {
                     let resp = mainnet::apis::wallet_api::get_all_token_balances(
-                        &self.api_config,
+                        config,
                         mainnet::models::GetAllTokenBalancesRequest {
                             wallet_id: wid.clone(),
                         },
@@ -591,12 +904,70 @@ impl BchWallet {
 
     /// List all fungible CashToken balances, with BCMR metadata.
     pub async fn get_fungible_tokens(&self) -> Result<Vec<FungibleToken>> {
-        // Query all token-aware addresses in chunked batches and merge by category.
+        if let Some(ref ex) = self.electrumx {
+            return self.get_fungible_tokens_electrumx(ex).await;
+        }
+        self.get_fungible_tokens_rest().await
+    }
+
+    async fn get_fungible_tokens_electrumx(
+        &self,
+        ex: &ElectrumxClient,
+    ) -> Result<Vec<FungibleToken>> {
+        // Aggregate token balances across all addresses
+        let mut merged: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, _)| ex.get_all_utxos(addr))
+                .collect();
+            for result in futures::future::join_all(futures).await.into_iter().flatten() {
+                for u in result {
+                    if let Some(ref td) = u.token_data {
+                        let amt = td.amount.parse::<f64>().unwrap_or(0.0);
+                        if amt > 0.0 {
+                            *merged.entry(td.category.clone()).or_insert(0.0) += amt;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fetch BCMR metadata for each category
+        let categories: Vec<_> = merged.into_iter().collect();
+        let mut tokens = Vec::new();
+        for chunk in categories.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(cat, _)| self.bcmr.get_token_info(cat))
+                .collect();
+            let metadata_results = futures::future::join_all(futures).await;
+            for ((category, amount), meta) in chunk.iter().zip(metadata_results) {
+                let (name, symbol, decimals) = match meta {
+                    Some(m) => (m.name, m.symbol, m.decimals),
+                    None => ("Unknown Token".to_string(), String::new(), 0),
+                };
+                tokens.push(FungibleToken {
+                    id: category.clone(),
+                    category: category.clone(),
+                    name,
+                    symbol,
+                    decimals,
+                    image_url: String::new(),
+                    balance: *amount,
+                });
+            }
+        }
+        Ok(tokens)
+    }
+
+    async fn get_fungible_tokens_rest(&self) -> Result<Vec<FungibleToken>> {
+        let config = self.rest_config().await?;
         let mut all_results = Vec::new();
         for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 mainnet::apis::wallet_api::get_all_token_balances(
-                    &self.api_config,
+                    config,
                     mainnet::models::GetAllTokenBalancesRequest {
                         wallet_id: wid.clone(),
                     },
@@ -613,7 +984,6 @@ impl BchWallet {
             }
         }
 
-        // Fetch BCMR metadata for all categories in parallel (chunked).
         let categories_with_amounts: Vec<_> = merged
             .into_iter()
             .filter(|(_, amount)| *amount > 0.0)
@@ -622,12 +992,14 @@ impl BchWallet {
         let mut tokens = Vec::new();
         for chunk in categories_with_amounts.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|(category, _)| {
-                Self::fetch_bcmr_metadata_static(&self.api_config, category)
+                self.bcmr.get_token_info(category)
             }).collect();
             let metadata_results = futures::future::join_all(futures).await;
-            for ((category, amount), (name, symbol, decimals)) in
-                chunk.iter().zip(metadata_results)
-            {
+            for ((category, amount), meta) in chunk.iter().zip(metadata_results) {
+                let (name, symbol, decimals) = match meta {
+                    Some(m) => (m.name, m.symbol, m.decimals),
+                    None => ("Unknown Token".to_string(), String::new(), 0),
+                };
                 tokens.push(FungibleToken {
                     id: category.clone(),
                     category: category.clone(),
@@ -645,9 +1017,12 @@ impl BchWallet {
 
     /// Get info for a specific CashToken (BCMR metadata).
     pub async fn get_token_info(&self, category: &str) -> Result<Option<FungibleToken>> {
-        let (name, symbol, decimals) = self.fetch_bcmr_metadata(category).await;
+        let meta = self.bcmr.get_token_info(category).await;
+        let (name, symbol, decimals) = match meta {
+            Some(m) => (m.name, m.symbol, m.decimals),
+            None => ("Unknown Token".to_string(), String::new(), 0),
+        };
 
-        // Even if BCMR returns nothing, we still return a token with unknown name
         Ok(Some(FungibleToken {
             id: category.to_string(),
             category: category.to_string(),
@@ -661,13 +1036,56 @@ impl BchWallet {
 
     /// Get NFT UTXOs, optionally filtered by category (across all token addresses).
     pub async fn get_nft_utxos(&self, category: Option<&str>) -> Result<Vec<NftUtxo>> {
+        if let Some(ref ex) = self.electrumx {
+            return self.get_nft_utxos_electrumx(ex, category).await;
+        }
+        self.get_nft_utxos_rest(category).await
+    }
+
+    async fn get_nft_utxos_electrumx(
+        &self,
+        ex: &ElectrumxClient,
+        category: Option<&str>,
+    ) -> Result<Vec<NftUtxo>> {
+        let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+        let mut nfts = Vec::new();
+        for chunk in self.bch_addresses.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(addr, _)| ex.get_all_utxos(addr))
+                .collect();
+            for result in futures::future::join_all(futures).await.into_iter().flatten() {
+                for u in result {
+                    let Some(ref td) = u.token_data else { continue };
+                    let Some(ref nft) = td.nft else { continue };
+                    if let Some(cat) = category {
+                        if td.category != cat { continue; }
+                    }
+                    if !seen.insert((u.txid.clone(), u.vout)) { continue; }
+                    nfts.push(NftUtxo {
+                        txid: u.txid,
+                        vout: u.vout,
+                        category: td.category.clone(),
+                        commitment: nft.commitment.clone(),
+                        capability: nft.capability.clone(),
+                        amount: td.amount.parse::<f64>().unwrap_or(0.0),
+                        value: u.value as f64,
+                    });
+                }
+            }
+        }
+        Ok(nfts)
+    }
+
+    async fn get_nft_utxos_rest(&self, category: Option<&str>) -> Result<Vec<NftUtxo>> {
+        let config = self.rest_config().await?;
         let cat = category.map(|c| c.to_string());
         let mut results = Vec::new();
         for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
             let futures: Vec<_> = chunk.iter().map(|wid| {
                 let cat = cat.clone();
                 mainnet::apis::wallet_api::get_token_utxos(
-                    &self.api_config,
+                    config,
                     mainnet::models::GetTokenUtxosRequest {
                         wallet_id: wid.clone(),
                         category: cat.as_ref().map(|c| Some(c.clone())),
@@ -677,7 +1095,6 @@ impl BchWallet {
             results.extend(futures::future::join_all(futures).await);
         }
 
-        // Deduplicate by (txid, vout) since same UTXO won't appear at multiple addresses.
         let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
         let mut nfts = Vec::new();
         for u in results.into_iter().filter_map(|r| r.ok()).flatten() {
@@ -688,19 +1105,15 @@ impl BchWallet {
                 Some(Some(t)) => t,
                 _ => continue,
             };
-
-            // NFTs have a non-null nft field
             let nft = match &token.nft {
                 Some(Some(n)) => n,
                 _ => continue,
             };
-
             let cap = match nft.capability {
                 mainnet::models::token_nft::Capability::None => "none",
                 mainnet::models::token_nft::Capability::Mutable => "mutable",
                 mainnet::models::token_nft::Capability::Minting => "minting",
             };
-
             nfts.push(NftUtxo {
                 txid: u.txid,
                 vout: u.vout as u32,
@@ -711,7 +1124,6 @@ impl BchWallet {
                 value: u.satoshis,
             });
         }
-
         Ok(nfts)
     }
 
@@ -1097,53 +1509,6 @@ impl BchWallet {
         }
     }
 
-    // ── Internal helpers ────────────────────────────────────────────
-
-    /// Fetch BCMR token metadata (name, symbol, decimals) for a category.
-    async fn fetch_bcmr_metadata(&self, category: &str) -> (String, String, u32) {
-        Self::fetch_bcmr_metadata_static(&self.api_config, category).await
-    }
-
-    /// Fetch BCMR token metadata without requiring &self (for use in parallel streams).
-    async fn fetch_bcmr_metadata_static(
-        config: &mainnet::apis::configuration::Configuration,
-        category: &str,
-    ) -> (String, String, u32) {
-        let resp = mainnet::apis::wallet_bcmr_api::bcmr_get_token_info(
-            config,
-            mainnet::models::BcmrGetTokenInfoRequest {
-                category: category.to_string(),
-            },
-        )
-        .await;
-
-        match resp {
-            Ok(info) => {
-                if let Some(Some(token_info)) = info.token_info {
-                    let name = token_info
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown Token")
-                        .to_string();
-                    let symbol = token_info
-                        .get("token")
-                        .and_then(|t| t.get("symbol"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let decimals = token_info
-                        .get("token")
-                        .and_then(|t| t.get("decimals"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    (name, symbol, decimals)
-                } else {
-                    ("Unknown Token".to_string(), String::new(), 0)
-                }
-            }
-            Err(_) => ("Unknown Token".to_string(), String::new(), 0),
-        }
-    }
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
@@ -1173,13 +1538,13 @@ mod tests {
 
     #[test]
     fn test_bch_wallet_new() {
-        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false);
+        let wallet = BchWallet::new_offline(TEST_MNEMONIC, BCH_DERIVATION_PATH, false);
         assert!(wallet.is_ok());
     }
 
     #[test]
     fn test_bch_wallet_address_derivation() {
-        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let wallet = BchWallet::new_offline(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
         let set = wallet.get_address_set_at(0).unwrap();
         assert!(set.receiving.starts_with("bitcoincash:q"));
         assert!(set.change.starts_with("bitcoincash:q"));
@@ -1187,7 +1552,7 @@ mod tests {
 
     #[test]
     fn test_bch_wallet_token_address_derivation() {
-        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let wallet = BchWallet::new_offline(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
         let set = wallet.get_token_address_set_at(0).unwrap();
         assert!(set.receiving.starts_with("bitcoincash:z"));
         assert!(set.change.starts_with("bitcoincash:z"));
@@ -1195,13 +1560,13 @@ mod tests {
 
     #[test]
     fn test_bch_wallet_invalid_mnemonic() {
-        let result = BchWallet::new("bad words here", BCH_DERIVATION_PATH, false);
+        let result = BchWallet::new_offline("bad words here", BCH_DERIVATION_PATH, false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_watch_ids_include_receiving_address() {
-        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let wallet = BchWallet::new_offline(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
         let addr = wallet.get_address_set_at(0).unwrap().receiving;
         assert!(wallet.watch_ids.iter().any(|w| w.contains(&addr)));
         assert!(wallet.watch_ids[0].starts_with("watch:mainnet:"));
@@ -1209,21 +1574,21 @@ mod tests {
 
     #[test]
     fn test_watch_ids_include_change_address() {
-        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let wallet = BchWallet::new_offline(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
         let change = wallet.get_address_set_at(0).unwrap().change;
         assert!(wallet.watch_ids.iter().any(|w| w.contains(&change)));
     }
 
     #[test]
     fn test_watch_ids_track_multiple_indices() {
-        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
+        let wallet = BchWallet::new_offline(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
         // ADDRESS_SCAN_COUNT indices × 2 (receiving + change) × 2 (regular + token)
         assert!(wallet.watch_ids.len() >= ADDRESS_SCAN_COUNT as usize * 2);
     }
 
     #[test]
     fn test_chipnet_watch_ids_use_testnet() {
-        let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, true).unwrap();
+        let wallet = BchWallet::new_offline(TEST_MNEMONIC, BCH_DERIVATION_PATH, true).unwrap();
         assert!(wallet.watch_ids[0].starts_with("watch:testnet:"));
     }
 }

@@ -11,7 +11,7 @@ pub async fn list(wallet_name: Option<&str>, chipnet: bool, verbose: bool) -> Re
     let network_name = if chipnet { "chipnet" } else { "mainnet" };
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     println!(
         "\n   {}\n",
@@ -147,7 +147,7 @@ pub async fn info(
     }
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     println!(
         "\n   {}\n",
@@ -243,7 +243,7 @@ pub async fn send(
     }
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     // Token change goes to our token address
     let token_change = bch.get_token_address_set_at(0)?.change;
@@ -340,7 +340,7 @@ pub async fn send_nft(args: SendNftArgs<'_>) -> Result<()> {
     }
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     // Resolve UTXO: either from flags or auto-detect
     let (resolved_txid, resolved_vout) = match (txid, vout) {

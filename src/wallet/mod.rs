@@ -36,8 +36,8 @@ pub struct Wallet {
 
 impl Wallet {
     /// Get a BchWallet for the given network.
-    pub fn for_network(&self, chipnet: bool) -> Result<BchWallet> {
-        BchWallet::new(&self.mnemonic, BCH_DERIVATION_PATH, chipnet)
+    pub async fn for_network(&self, chipnet: bool) -> Result<BchWallet> {
+        BchWallet::new(&self.mnemonic, BCH_DERIVATION_PATH, chipnet).await
     }
 
     /// Get an HdWallet for the given network.

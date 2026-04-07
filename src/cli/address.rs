@@ -4,7 +4,7 @@ use owo_colors::OwoColorize;
 use crate::wallet;
 
 /// Derive receiving + change addresses at a specific index.
-pub fn derive(
+pub async fn derive(
     wallet_name: Option<&str>,
     index: u32,
     chipnet: bool,
@@ -13,7 +13,7 @@ pub fn derive(
     let network = if chipnet { "chipnet" } else { "mainnet" };
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     let addr_set = if token {
         bch.get_token_address_set_at(index)?
@@ -36,7 +36,7 @@ pub fn derive(
 }
 
 /// List multiple derived receiving addresses.
-pub fn list(
+pub async fn list(
     wallet_name: Option<&str>,
     count: u32,
     chipnet: bool,
@@ -45,7 +45,7 @@ pub fn list(
     let network = if chipnet { "chipnet" } else { "mainnet" };
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     let type_label = if token {
         "Token Addresses"

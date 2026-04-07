@@ -15,7 +15,7 @@ pub async fn run(
     let network = if chipnet { "chipnet" } else { "mainnet" };
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     if let Some(tid) = token_id {
         // Validate hex format

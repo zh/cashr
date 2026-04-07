@@ -42,7 +42,7 @@ pub async fn create(name: &str, chipnet: bool) -> Result<()> {
 
     // Derive and show address
     if let Ok(w) = wallet::load_wallet(Some(name)) {
-        if let Ok(bch) = w.for_network(chipnet) {
+        if let Ok(bch) = w.for_network(chipnet).await {
             if let Ok(addr_set) = bch.get_address_set_at(0) {
                 println!("   {}", format!("Network:     {}", network).dimmed());
                 println!(
@@ -88,7 +88,7 @@ pub async fn import(name: &str, chipnet: bool) -> Result<()> {
 
     // Derive and show address
     if let Ok(w) = wallet::load_wallet(Some(name)) {
-        if let Ok(bch) = w.for_network(chipnet) {
+        if let Ok(bch) = w.for_network(chipnet).await {
             if let Ok(addr_set) = bch.get_address_set_at(0) {
                 println!(
                     "   {}",
@@ -107,7 +107,7 @@ pub async fn info(wallet_name: Option<&str>, chipnet: bool) -> Result<()> {
     let network = if chipnet { "chipnet" } else { "mainnet" };
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     println!("\n   {}\n", format!("Wallet Info ({})", network).bold());
     println!(

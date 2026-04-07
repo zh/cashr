@@ -36,7 +36,7 @@ pub fn set_base_dir_override(path: Option<PathBuf>) {
 }
 
 /// Get base directory: thread-local override > CASHR_HOME env var > ~/.cashr.
-fn base_dir() -> Result<PathBuf> {
+pub(crate) fn base_dir() -> Result<PathBuf> {
     let override_path = BASE_DIR_OVERRIDE.with(|cell| cell.borrow().clone());
     if let Some(path) = override_path {
         return Ok(path);

@@ -33,7 +33,7 @@ pub async fn run(
     }
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
 
     // Resolve token label for header
     let mut header_label = "Transaction History".to_string();

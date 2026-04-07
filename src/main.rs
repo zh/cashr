@@ -1,9 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod bcmr;
 mod cli;
+mod config;
 mod constants;
 mod crypto;
+mod electrumx;
 mod network;
 mod storage;
 mod transaction;
@@ -346,14 +349,14 @@ async fn run() -> Result<()> {
                 chipnet,
                 token,
             } => {
-                cli::address::derive(wallet_name, index, chipnet || auto_chipnet, token)?;
+                cli::address::derive(wallet_name, index, chipnet || auto_chipnet, token).await?;
             }
             AddressCommand::List {
                 count,
                 chipnet,
                 token,
             } => {
-                cli::address::list(wallet_name, count, chipnet || auto_chipnet, token)?;
+                cli::address::list(wallet_name, count, chipnet || auto_chipnet, token).await?;
             }
         },
         Commands::Balance {

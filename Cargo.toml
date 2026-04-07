@@ -26,6 +26,7 @@ mainnet = { git = "https://github.com/zh/mainnet-rust-generated", branch = "main
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 # Crypto
 bip39 = "2"

@@ -43,7 +43,7 @@ pub async fn run(
     let parsed_headers = parse_headers(raw_headers)?;
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
-    let bch = w.for_network(chipnet)?;
+    let bch = w.for_network(chipnet).await?;
     let hd = w.hd_wallet(chipnet)?;
 
     let addr_index = payer_index.unwrap_or(0);
