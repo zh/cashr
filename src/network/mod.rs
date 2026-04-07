@@ -15,10 +15,15 @@ pub fn watch_wallet_id(chipnet: bool, cashaddr: &str) -> String {
     format!("watch:{}:{}", network, cashaddr)
 }
 
-/// Create a mainnet API configuration.
+/// Create a mainnet API configuration with a request timeout.
 pub fn mainnet_config(chipnet: bool) -> mainnet::apis::configuration::Configuration {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
     mainnet::apis::configuration::Configuration {
         base_path: mainnet_api_url(chipnet).to_string(),
+        client,
         ..Default::default()
     }
 }

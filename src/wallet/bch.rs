@@ -6,7 +6,9 @@
 /// - Key material NEVER leaves the machine
 use anyhow::{Context, Result};
 
-use crate::constants::{DEFAULT_FEE_RATE, DEFAULT_PAGE_SIZE, FEE_RESERVE_SATS, SATS_PER_BCH};
+use crate::constants::{
+    DEFAULT_FEE_RATE, DEFAULT_PAGE_SIZE, FEE_RESERVE_SATS, MAX_CONCURRENT_REQUESTS, SATS_PER_BCH,
+};
 use crate::network;
 use crate::transaction;
 use crate::types::{
@@ -26,7 +28,16 @@ fn extract_lacking_sats(err_msg: &str) -> Option<u64> {
 }
 
 /// Number of address indices to track (receiving + change at each index).
-const ADDRESS_SCAN_COUNT: u32 = 10;
+/// Keep low to minimize API calls — most wallets only use index 0.
+const ADDRESS_SCAN_COUNT: u32 = 2;
+
+/// (watch_ids, bch_watch_ids, token_watch_ids, watch_paths)
+type WatchIdSets = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    std::collections::HashMap<String, String>,
+);
 
 /// Core BCH wallet combining local key derivation with Mainnet Cash REST API.
 pub struct BchWallet {
@@ -63,49 +74,16 @@ pub struct NftSendParams {
 
 impl BchWallet {
     /// Create a new BchWallet.
+    ///
+    /// Derives watch IDs for ADDRESS_SCAN_COUNT address indices. The actual number
+    /// of indices actively queried can be reduced at runtime via `discover_active_indices()`.
     pub fn new(mnemonic: &str, path: &str, chipnet: bool) -> Result<Self> {
         let hd_wallet = HdWallet::new(mnemonic, path, chipnet)?;
         let wallet_hash = hd_wallet.wallet_hash().to_string();
         let api_config = network::mainnet_config(chipnet);
 
-        // Build watch IDs for first N address indices (receiving + change + token).
-        // Regular (q-prefix) and token (z-prefix) addresses share the same hash160,
-        // so the API returns the same UTXOs/balance for both. We track them separately
-        // to avoid double-counting in BCH operations.
-        let mut watch_ids = Vec::new();
-        let mut bch_watch_ids = Vec::new();
-        let mut token_watch_ids = Vec::new();
-        let mut watch_paths = std::collections::HashMap::new();
-        for i in 0..ADDRESS_SCAN_COUNT {
-            let addrs = hd_wallet.get_address_set_at(i)?;
-            let token_addrs = hd_wallet.get_token_address_set_at(i)?;
-
-            // Regular addresses (for BCH balance/history — no double-counting)
-            for (addr, addr_path) in [
-                (&addrs.receiving, format!("0/{}", i)),
-                (&addrs.change, format!("1/{}", i)),
-            ] {
-                let wid = network::watch_wallet_id(chipnet, addr);
-                if !watch_paths.contains_key(&wid) {
-                    watch_ids.push(wid.clone());
-                    bch_watch_ids.push(wid.clone());
-                    watch_paths.insert(wid, addr_path);
-                }
-            }
-
-            // Token addresses (for token operations only)
-            for (addr, addr_path) in [
-                (&token_addrs.receiving, format!("0/{}", i)),
-                (&token_addrs.change, format!("1/{}", i)),
-            ] {
-                let wid = network::watch_wallet_id(chipnet, addr);
-                if !watch_paths.contains_key(&wid) {
-                    watch_ids.push(wid.clone());
-                    token_watch_ids.push(wid.clone());
-                    watch_paths.insert(wid, addr_path);
-                }
-            }
-        }
+        let (watch_ids, bch_watch_ids, token_watch_ids, watch_paths) =
+            Self::build_watch_ids(&hd_wallet, chipnet, ADDRESS_SCAN_COUNT)?;
 
         Ok(Self {
             wallet_hash,
@@ -116,6 +94,52 @@ impl BchWallet {
             token_watch_ids,
             watch_paths,
         })
+    }
+
+    /// Build watch ID vectors for the given number of address indices.
+    fn build_watch_ids(
+        hd_wallet: &HdWallet,
+        chipnet: bool,
+        count: u32,
+    ) -> Result<WatchIdSets> {
+        // Regular (q-prefix) and token (z-prefix) addresses share the same hash160,
+        // so the API returns the same UTXOs/balance for both. We track them separately
+        // to avoid double-counting in BCH operations.
+        let mut watch_ids = Vec::new();
+        let mut bch_watch_ids = Vec::new();
+        let mut token_watch_ids = Vec::new();
+        let mut watch_paths = std::collections::HashMap::new();
+        for i in 0..count {
+            let addrs = hd_wallet.get_address_set_at(i)?;
+            let token_addrs = hd_wallet.get_token_address_set_at(i)?;
+
+            // Regular addresses (for BCH balance/history — no double-counting)
+            for (addr, addr_path) in [
+                (&addrs.receiving, format!("0/{}", i)),
+                (&addrs.change, format!("1/{}", i)),
+            ] {
+                let wid = network::watch_wallet_id(chipnet, addr);
+                if let std::collections::hash_map::Entry::Vacant(e) = watch_paths.entry(wid.clone()) {
+                    watch_ids.push(wid.clone());
+                    bch_watch_ids.push(wid);
+                    e.insert(addr_path);
+                }
+            }
+
+            // Token addresses (for token operations only)
+            for (addr, addr_path) in [
+                (&token_addrs.receiving, format!("0/{}", i)),
+                (&token_addrs.change, format!("1/{}", i)),
+            ] {
+                let wid = network::watch_wallet_id(chipnet, addr);
+                if let std::collections::hash_map::Entry::Vacant(e) = watch_paths.entry(wid.clone()) {
+                    watch_ids.push(wid.clone());
+                    token_watch_ids.push(wid);
+                    e.insert(addr_path);
+                }
+            }
+        }
+        Ok((watch_ids, bch_watch_ids, token_watch_ids, watch_paths))
     }
 
     /// Derive receiving + change addresses at index (delegates to HdWallet).
@@ -130,20 +154,23 @@ impl BchWallet {
 
     // ── Read operations (watch wallet ID -- no keys exposed) ────────
 
-    /// Get wallet BCH balance via Mainnet Cash API (parallel across all tracked addresses).
+    /// Get wallet BCH balance via Mainnet Cash API (chunked parallel requests).
     pub async fn get_balance(&self) -> Result<BalanceResponse> {
-        let futures: Vec<_> = self.bch_watch_ids.iter().map(|wid| {
-            mainnet::apis::wallet_api::balance(
-                &self.api_config,
-                mainnet::models::BalanceRequest {
-                    wallet_id: wid.clone(),
-                    slp_semi_aware: None,
-                },
-            )
-        }).collect();
+        let mut all_results = Vec::new();
+        for chunk in self.bch_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                mainnet::apis::wallet_api::balance(
+                    &self.api_config,
+                    mainnet::models::BalanceRequest {
+                        wallet_id: wid.clone(),
+                        slp_semi_aware: None,
+                    },
+                )
+            }).collect();
+            all_results.extend(futures::future::join_all(futures).await);
+        }
 
-        let results = futures::future::join_all(futures).await;
-        let total_sats: f64 = results.into_iter()
+        let total_sats: f64 = all_results.into_iter()
             .filter_map(|r| r.ok())
             .filter_map(|r| r.sat)
             .filter_map(|s| s.parse::<f64>().ok())
@@ -159,28 +186,35 @@ impl BchWallet {
 
     /// Get per-address BCH balances (for verbose/debug output).
     pub async fn get_address_balances(&self) -> Result<Vec<(String, String, f64)>> {
-        let futures: Vec<_> = self.bch_watch_ids.iter().map(|wid| {
-            mainnet::apis::wallet_api::balance(
-                &self.api_config,
-                mainnet::models::BalanceRequest {
-                    wallet_id: wid.clone(),
-                    slp_semi_aware: None,
-                },
-            )
-        }).collect();
-
-        let results = futures::future::join_all(futures).await;
+        let mut results = Vec::new();
+        for chunk in self.bch_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                let wid = wid.clone();
+                async move {
+                    let resp = mainnet::apis::wallet_api::balance(
+                        &self.api_config,
+                        mainnet::models::BalanceRequest {
+                            wallet_id: wid.clone(),
+                            slp_semi_aware: None,
+                        },
+                    )
+                    .await;
+                    (wid, resp)
+                }
+            }).collect();
+            results.extend(futures::future::join_all(futures).await);
+        }
         let mut balances = Vec::new();
-        for (wid, result) in self.bch_watch_ids.iter().zip(results) {
+        for (wid, result) in results {
             let sats: f64 = result
                 .ok()
                 .and_then(|r| r.sat)
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             if sats > 0.0 {
-                let path = self.watch_paths.get(wid).cloned().unwrap_or_default();
+                let path = self.watch_paths.get(&wid).cloned().unwrap_or_default();
                 // Extract the cashaddr from the watch_id (format: "watch:{network}:{addr}")
-                let addr = wid.splitn(3, ':').nth(2).unwrap_or(wid).to_string();
+                let addr = wid.splitn(3, ':').nth(2).unwrap_or(&wid).to_string();
                 balances.push((path, addr, sats));
             }
         }
@@ -189,18 +223,20 @@ impl BchWallet {
 
     /// Get token balance for a specific category (across all token addresses).
     pub async fn get_token_balance(&self, category: &str) -> Result<BalanceResponse> {
-        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
-            mainnet::apis::wallet_api::get_token_balance(
-                &self.api_config,
-                mainnet::models::GetTokenBalanceRequest {
-                    wallet_id: wid.clone(),
-                    category: category.to_string(),
-                },
-            )
-        }).collect();
-
-        let results = futures::future::join_all(futures).await;
-        let balance: f64 = results.into_iter()
+        let mut all_results = Vec::new();
+        for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                mainnet::apis::wallet_api::get_token_balance(
+                    &self.api_config,
+                    mainnet::models::GetTokenBalanceRequest {
+                        wallet_id: wid.clone(),
+                        category: category.to_string(),
+                    },
+                )
+            }).collect();
+            all_results.extend(futures::future::join_all(futures).await);
+        }
+        let balance: f64 = all_results.into_iter()
             .filter_map(|r| r.ok())
             .filter_map(|r| r.balance)
             .sum();
@@ -213,19 +249,20 @@ impl BchWallet {
         })
     }
 
-    /// Get BCH (non-token) UTXOs via Mainnet Cash API (parallel across all tracked addresses).
+    /// Get BCH (non-token) UTXOs via Mainnet Cash API (chunked parallel requests).
     pub async fn get_bch_utxos(&self) -> Result<Vec<transaction::Utxo>> {
-        let futures: Vec<_> = self.watch_ids.iter().map(|wid| {
-            let watch = serde_json::json!({ "walletId": wid });
-            let wid = wid.clone();
-            let config = &self.api_config;
-            async move {
-                let utxos = mainnet::apis::wallet_api::utxos(config, watch).await.ok();
-                (wid, utxos)
-            }
-        }).collect();
-
-        let results = futures::future::join_all(futures).await;
+        let mut results = Vec::new();
+        for chunk in self.watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                let watch = serde_json::json!({ "walletId": wid });
+                let wid = wid.clone();
+                async move {
+                    let utxos = mainnet::apis::wallet_api::utxos(&self.api_config, watch).await.ok();
+                    (wid, utxos)
+                }
+            }).collect();
+            results.extend(futures::future::join_all(futures).await);
+        }
         let mut result = Vec::new();
         for (wid, utxos) in results {
             let Some(utxos) = utxos else { continue };
@@ -246,26 +283,26 @@ impl BchWallet {
         Ok(result)
     }
 
-    /// Get CashToken UTXOs for a specific category (parallel across all tracked addresses).
+    /// Get CashToken UTXOs for a specific category (chunked parallel requests).
     pub async fn get_cashtoken_utxos(&self, category: &str) -> Result<Vec<CashTokenUtxo>> {
-        let cat = category.to_string();
-        let futures: Vec<_> = self.watch_ids.iter().map(|wid| {
-            let wid = wid.clone();
-            let cat = cat.clone();
-            let config = &self.api_config;
-            async move {
-                let resp = mainnet::apis::wallet_api::get_token_utxos(
-                    config,
-                    mainnet::models::GetTokenUtxosRequest {
-                        wallet_id: wid.clone(),
-                        category: Some(Some(cat)),
-                    },
-                ).await.ok();
-                (wid, resp)
-            }
-        }).collect();
-
-        let results = futures::future::join_all(futures).await;
+        let mut results = Vec::new();
+        for chunk in self.watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                let wid = wid.clone();
+                let cat = category.to_string();
+                async move {
+                    let resp = mainnet::apis::wallet_api::get_token_utxos(
+                        &self.api_config,
+                        mainnet::models::GetTokenUtxosRequest {
+                            wallet_id: wid.clone(),
+                            category: Some(Some(cat)),
+                        },
+                    ).await.ok();
+                    (wid, resp)
+                }
+            }).collect();
+            results.extend(futures::future::join_all(futures).await);
+        }
         let mut utxos = Vec::new();
         for (wid, resp) in results {
             let Some(items) = resp else { continue };
@@ -337,21 +374,23 @@ impl BchWallet {
         } else {
             &self.watch_ids
         };
-        let futures: Vec<_> = ids.iter().map(|wid| {
-            mainnet::apis::wallet_api::get_history(
-                &self.api_config,
-                mainnet::models::HistoryRequest {
-                    wallet_id: wid.clone(),
-                    unit: Some(mainnet::models::history_request::Unit::Sat),
-                    from_height: None,
-                    to_height: None,
-                    start: Some(0.0),
-                    count: Some(fetch_count),
-                },
-            )
-        }).collect();
-
-        let results = futures::future::join_all(futures).await;
+        let mut results = Vec::new();
+        for chunk in ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                mainnet::apis::wallet_api::get_history(
+                    &self.api_config,
+                    mainnet::models::HistoryRequest {
+                        wallet_id: wid.clone(),
+                        unit: Some(mainnet::models::history_request::Unit::Sat),
+                        from_height: None,
+                        to_height: None,
+                        start: Some(0.0),
+                        count: Some(fetch_count),
+                    },
+                )
+            }).collect();
+            results.extend(futures::future::join_all(futures).await);
+        }
 
         // Merge results across addresses, summing value_change for same txid.
         let mut merged: std::collections::HashMap<String, mainnet::models::TransactionHistoryItem> =
@@ -510,18 +549,26 @@ impl BchWallet {
     pub async fn get_address_token_balances(
         &self,
     ) -> Result<Vec<(String, String, std::collections::HashMap<String, f64>)>> {
-        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
-            mainnet::apis::wallet_api::get_all_token_balances(
-                &self.api_config,
-                mainnet::models::GetAllTokenBalancesRequest {
-                    wallet_id: wid.clone(),
-                },
-            )
-        }).collect();
+        let mut results = Vec::new();
+        for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                let wid = wid.clone();
+                async move {
+                    let resp = mainnet::apis::wallet_api::get_all_token_balances(
+                        &self.api_config,
+                        mainnet::models::GetAllTokenBalancesRequest {
+                            wallet_id: wid.clone(),
+                        },
+                    )
+                    .await;
+                    (wid, resp)
+                }
+            }).collect();
+            results.extend(futures::future::join_all(futures).await);
+        }
 
-        let results = futures::future::join_all(futures).await;
         let mut out = Vec::new();
-        for (wid, result) in self.token_watch_ids.iter().zip(results) {
+        for (wid, result) in results {
             let balances = match result {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -534,8 +581,8 @@ impl BchWallet {
                 })
                 .collect();
             if !parsed.is_empty() {
-                let path = self.watch_paths.get(wid).cloned().unwrap_or_default();
-                let addr = wid.splitn(3, ':').nth(2).unwrap_or(wid).to_string();
+                let path = self.watch_paths.get(&wid).cloned().unwrap_or_default();
+                let addr = wid.splitn(3, ':').nth(2).unwrap_or(&wid).to_string();
                 out.push((path, addr, parsed));
             }
         }
@@ -544,43 +591,53 @@ impl BchWallet {
 
     /// List all fungible CashToken balances, with BCMR metadata.
     pub async fn get_fungible_tokens(&self) -> Result<Vec<FungibleToken>> {
-        // Query all token-aware addresses in parallel and merge by category.
-        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
-            mainnet::apis::wallet_api::get_all_token_balances(
-                &self.api_config,
-                mainnet::models::GetAllTokenBalancesRequest {
-                    wallet_id: wid.clone(),
-                },
-            )
-        }).collect();
+        // Query all token-aware addresses in chunked batches and merge by category.
+        let mut all_results = Vec::new();
+        for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                mainnet::apis::wallet_api::get_all_token_balances(
+                    &self.api_config,
+                    mainnet::models::GetAllTokenBalancesRequest {
+                        wallet_id: wid.clone(),
+                    },
+                )
+            }).collect();
+            all_results.extend(futures::future::join_all(futures).await);
+        }
 
-        let results = futures::future::join_all(futures).await;
         let mut merged: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-        for result in results.into_iter().filter_map(|r| r.ok()) {
+        for result in all_results.into_iter().filter_map(|r| r.ok()) {
             for (category, amount_str) in result {
                 let amount: f64 = amount_str.parse().unwrap_or(0.0);
                 *merged.entry(category).or_insert(0.0) += amount;
             }
         }
 
+        // Fetch BCMR metadata for all categories in parallel (chunked).
+        let categories_with_amounts: Vec<_> = merged
+            .into_iter()
+            .filter(|(_, amount)| *amount > 0.0)
+            .collect();
+
         let mut tokens = Vec::new();
-        for (category, amount) in merged {
-            if amount <= 0.0 {
-                continue;
+        for chunk in categories_with_amounts.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|(category, _)| {
+                Self::fetch_bcmr_metadata_static(&self.api_config, category)
+            }).collect();
+            let metadata_results = futures::future::join_all(futures).await;
+            for ((category, amount), (name, symbol, decimals)) in
+                chunk.iter().zip(metadata_results)
+            {
+                tokens.push(FungibleToken {
+                    id: category.clone(),
+                    category: category.clone(),
+                    name,
+                    symbol,
+                    decimals,
+                    image_url: String::new(),
+                    balance: *amount,
+                });
             }
-
-            // Fetch BCMR metadata for this category
-            let (name, symbol, decimals) = self.fetch_bcmr_metadata(&category).await;
-
-            tokens.push(FungibleToken {
-                id: category.clone(),
-                category,
-                name,
-                symbol,
-                decimals,
-                image_url: String::new(),
-                balance: amount,
-            });
         }
 
         Ok(tokens)
@@ -605,17 +662,20 @@ impl BchWallet {
     /// Get NFT UTXOs, optionally filtered by category (across all token addresses).
     pub async fn get_nft_utxos(&self, category: Option<&str>) -> Result<Vec<NftUtxo>> {
         let cat = category.map(|c| c.to_string());
-        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
-            mainnet::apis::wallet_api::get_token_utxos(
-                &self.api_config,
-                mainnet::models::GetTokenUtxosRequest {
-                    wallet_id: wid.clone(),
-                    category: cat.as_ref().map(|c| Some(c.clone())),
-                },
-            )
-        }).collect();
-
-        let results = futures::future::join_all(futures).await;
+        let mut results = Vec::new();
+        for chunk in self.token_watch_ids.chunks(MAX_CONCURRENT_REQUESTS) {
+            let futures: Vec<_> = chunk.iter().map(|wid| {
+                let cat = cat.clone();
+                mainnet::apis::wallet_api::get_token_utxos(
+                    &self.api_config,
+                    mainnet::models::GetTokenUtxosRequest {
+                        wallet_id: wid.clone(),
+                        category: cat.as_ref().map(|c| Some(c.clone())),
+                    },
+                )
+            }).collect();
+            results.extend(futures::future::join_all(futures).await);
+        }
 
         // Deduplicate by (txid, vout) since same UTXO won't appear at multiple addresses.
         let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
@@ -1041,8 +1101,16 @@ impl BchWallet {
 
     /// Fetch BCMR token metadata (name, symbol, decimals) for a category.
     async fn fetch_bcmr_metadata(&self, category: &str) -> (String, String, u32) {
+        Self::fetch_bcmr_metadata_static(&self.api_config, category).await
+    }
+
+    /// Fetch BCMR token metadata without requiring &self (for use in parallel streams).
+    async fn fetch_bcmr_metadata_static(
+        config: &mainnet::apis::configuration::Configuration,
+        category: &str,
+    ) -> (String, String, u32) {
         let resp = mainnet::apis::wallet_bcmr_api::bcmr_get_token_info(
-            &self.api_config,
+            config,
             mainnet::models::BcmrGetTokenInfoRequest {
                 category: category.to_string(),
             },
@@ -1149,9 +1217,8 @@ mod tests {
     #[test]
     fn test_watch_ids_track_multiple_indices() {
         let wallet = BchWallet::new(TEST_MNEMONIC, BCH_DERIVATION_PATH, false).unwrap();
-        // Should track 10 indices × 2 (receiving + change) = 20 unique addresses
-        // Token addresses share the same hash so may deduplicate
-        assert!(wallet.watch_ids.len() >= 20);
+        // ADDRESS_SCAN_COUNT indices × 2 (receiving + change) × 2 (regular + token)
+        assert!(wallet.watch_ids.len() >= ADDRESS_SCAN_COUNT as usize * 2);
     }
 
     #[test]

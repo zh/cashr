@@ -11,3 +11,6 @@ pub const FEE_RESERVE_SATS: u64 = 2000;
 
 /// Default fee rate (satoshis per byte).
 pub const DEFAULT_FEE_RATE: f64 = 1.2;
+
+/// Maximum number of concurrent API requests to the REST server.
+pub const MAX_CONCURRENT_REQUESTS: usize = 4;
