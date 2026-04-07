@@ -1,38 +1,10 @@
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
+use crate::cli::utils::{bch_to_sats, format_sats, short_txid};
 use crate::network;
 use crate::wallet;
 use crate::wallet::bch::HistoryOptions;
-
-/// Convert BCH to satoshis.
-fn bch_to_sats(bch: f64) -> i64 {
-    (bch * 1e8).round() as i64
-}
-
-/// Format satoshis with thousands separators.
-fn format_sats(sats: i64) -> String {
-    let s = sats.abs().to_string();
-    let mut result = String::new();
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
-    }
-    if sats < 0 {
-        result.push('-');
-    }
-    result.chars().rev().collect()
-}
-
-/// Truncate a txid for display.
-fn short_txid(txid: &str) -> String {
-    if txid.len() <= 20 {
-        return txid.to_string();
-    }
-    format!("{}...{}", &txid[..10], &txid[txid.len() - 10..])
-}
 
 /// Display transaction history.
 pub async fn run(

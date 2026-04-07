@@ -6,6 +6,7 @@
 /// - Key material NEVER leaves the machine
 use anyhow::{Context, Result};
 
+use crate::constants::{DEFAULT_FEE_RATE, DEFAULT_PAGE_SIZE, FEE_RESERVE_SATS, SATS_PER_BCH};
 use crate::network;
 use crate::transaction;
 use crate::types::{
@@ -14,6 +15,15 @@ use crate::types::{
 };
 
 use super::keys::{AddressSet, HdWallet};
+
+/// Extract "short by N sats" from a transaction build error message.
+fn extract_lacking_sats(err_msg: &str) -> Option<u64> {
+    err_msg
+        .split("short by ")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse::<u64>().ok())
+}
 
 /// Number of address indices to track (receiving + change at each index).
 const ADDRESS_SCAN_COUNT: u32 = 10;
@@ -25,6 +35,10 @@ pub struct BchWallet {
     api_config: mainnet::apis::configuration::Configuration,
     /// Watch wallet IDs for all tracked addresses (receiving + change + token addresses).
     watch_ids: Vec<String>,
+    /// Watch wallet IDs for regular (q-prefix) addresses only — for BCH operations.
+    bch_watch_ids: Vec<String>,
+    /// Watch wallet IDs for token-aware (z-prefix) addresses only — for token operations.
+    token_watch_ids: Vec<String>,
     /// Address path mapping: watch_id -> address_path (e.g. "0/0", "1/3")
     watch_paths: std::collections::HashMap<String, String>,
 }
@@ -54,22 +68,40 @@ impl BchWallet {
         let wallet_hash = hd_wallet.wallet_hash().to_string();
         let api_config = network::mainnet_config(chipnet);
 
-        // Build watch IDs for first N address indices (receiving + change + token)
+        // Build watch IDs for first N address indices (receiving + change + token).
+        // Regular (q-prefix) and token (z-prefix) addresses share the same hash160,
+        // so the API returns the same UTXOs/balance for both. We track them separately
+        // to avoid double-counting in BCH operations.
         let mut watch_ids = Vec::new();
+        let mut bch_watch_ids = Vec::new();
+        let mut token_watch_ids = Vec::new();
         let mut watch_paths = std::collections::HashMap::new();
         for i in 0..ADDRESS_SCAN_COUNT {
             let addrs = hd_wallet.get_address_set_at(i)?;
             let token_addrs = hd_wallet.get_token_address_set_at(i)?;
 
+            // Regular addresses (for BCH balance/history — no double-counting)
             for (addr, addr_path) in [
                 (&addrs.receiving, format!("0/{}", i)),
                 (&addrs.change, format!("1/{}", i)),
+            ] {
+                let wid = network::watch_wallet_id(chipnet, addr);
+                if !watch_paths.contains_key(&wid) {
+                    watch_ids.push(wid.clone());
+                    bch_watch_ids.push(wid.clone());
+                    watch_paths.insert(wid, addr_path);
+                }
+            }
+
+            // Token addresses (for token operations only)
+            for (addr, addr_path) in [
                 (&token_addrs.receiving, format!("0/{}", i)),
                 (&token_addrs.change, format!("1/{}", i)),
             ] {
                 let wid = network::watch_wallet_id(chipnet, addr);
                 if !watch_paths.contains_key(&wid) {
                     watch_ids.push(wid.clone());
+                    token_watch_ids.push(wid.clone());
                     watch_paths.insert(wid, addr_path);
                 }
             }
@@ -80,6 +112,8 @@ impl BchWallet {
             hd_wallet,
             api_config,
             watch_ids,
+            bch_watch_ids,
+            token_watch_ids,
             watch_paths,
         })
     }
@@ -98,7 +132,7 @@ impl BchWallet {
 
     /// Get wallet BCH balance via Mainnet Cash API (parallel across all tracked addresses).
     pub async fn get_balance(&self) -> Result<BalanceResponse> {
-        let futures: Vec<_> = self.watch_ids.iter().map(|wid| {
+        let futures: Vec<_> = self.bch_watch_ids.iter().map(|wid| {
             mainnet::apis::wallet_api::balance(
                 &self.api_config,
                 mainnet::models::BalanceRequest {
@@ -118,24 +152,59 @@ impl BchWallet {
         Ok(BalanceResponse {
             valid: true,
             wallet: self.wallet_hash.clone(),
-            balance: total_sats / 1e8,
-            spendable: total_sats / 1e8,
+            balance: total_sats / SATS_PER_BCH,
+            spendable: total_sats / SATS_PER_BCH,
         })
     }
 
-    /// Get token balance for a specific category.
-    pub async fn get_token_balance(&self, category: &str) -> Result<BalanceResponse> {
-        let resp = mainnet::apis::wallet_api::get_token_balance(
-            &self.api_config,
-            mainnet::models::GetTokenBalanceRequest {
-                wallet_id: self.watch_ids[0].clone(),
-                category: category.to_string(),
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("token balance request failed: {:?}", e))?;
+    /// Get per-address BCH balances (for verbose/debug output).
+    pub async fn get_address_balances(&self) -> Result<Vec<(String, String, f64)>> {
+        let futures: Vec<_> = self.bch_watch_ids.iter().map(|wid| {
+            mainnet::apis::wallet_api::balance(
+                &self.api_config,
+                mainnet::models::BalanceRequest {
+                    wallet_id: wid.clone(),
+                    slp_semi_aware: None,
+                },
+            )
+        }).collect();
 
-        let balance = resp.balance.unwrap_or(0.0);
+        let results = futures::future::join_all(futures).await;
+        let mut balances = Vec::new();
+        for (wid, result) in self.bch_watch_ids.iter().zip(results) {
+            let sats: f64 = result
+                .ok()
+                .and_then(|r| r.sat)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            if sats > 0.0 {
+                let path = self.watch_paths.get(wid).cloned().unwrap_or_default();
+                // Extract the cashaddr from the watch_id (format: "watch:{network}:{addr}")
+                let addr = wid.splitn(3, ':').nth(2).unwrap_or(wid).to_string();
+                balances.push((path, addr, sats));
+            }
+        }
+        Ok(balances)
+    }
+
+    /// Get token balance for a specific category (across all token addresses).
+    pub async fn get_token_balance(&self, category: &str) -> Result<BalanceResponse> {
+        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
+            mainnet::apis::wallet_api::get_token_balance(
+                &self.api_config,
+                mainnet::models::GetTokenBalanceRequest {
+                    wallet_id: wid.clone(),
+                    category: category.to_string(),
+                },
+            )
+        }).collect();
+
+        let results = futures::future::join_all(futures).await;
+        let balance: f64 = results.into_iter()
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.balance)
+            .sum();
+
         Ok(BalanceResponse {
             valid: true,
             wallet: self.wallet_hash.clone(),
@@ -257,27 +326,90 @@ impl BchWallet {
 
     /// Get transaction history via Mainnet Cash API.
     pub async fn get_history(&self, opts: HistoryOptions) -> Result<HistoryResponse> {
-        // Mainnet API uses start/count for pagination, not page numbers.
-        // Each "page" is 10 items.
-        let page_size: f64 = 10.0;
-        let start = ((opts.page as f64) - 1.0) * page_size;
+        // Query all tracked addresses in parallel, then merge & deduplicate.
+        let page_size: usize = DEFAULT_PAGE_SIZE;
+        // Fetch enough from each address to fill the requested page after merging.
+        let fetch_count = (opts.page as f64) * (page_size as f64) + 1.0;
 
-        let items = mainnet::apis::wallet_api::get_history(
-            &self.api_config,
-            mainnet::models::HistoryRequest {
-                wallet_id: self.watch_ids[0].clone(),
-                unit: Some(mainnet::models::history_request::Unit::Sat),
-                from_height: None,
-                to_height: None,
-                start: Some(start),
-                count: Some(page_size + 1.0), // fetch one extra to detect has_next
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("history request failed: {:?}", e))?;
+        // Use bch_watch_ids for BCH history, full watch_ids for token history.
+        let ids = if opts.token_id.is_empty() {
+            &self.bch_watch_ids
+        } else {
+            &self.watch_ids
+        };
+        let futures: Vec<_> = ids.iter().map(|wid| {
+            mainnet::apis::wallet_api::get_history(
+                &self.api_config,
+                mainnet::models::HistoryRequest {
+                    wallet_id: wid.clone(),
+                    unit: Some(mainnet::models::history_request::Unit::Sat),
+                    from_height: None,
+                    to_height: None,
+                    start: Some(0.0),
+                    count: Some(fetch_count),
+                },
+            )
+        }).collect();
 
-        let has_next = items.len() > page_size as usize;
-        let display_items: Vec<_> = items.into_iter().take(page_size as usize).collect();
+        let results = futures::future::join_all(futures).await;
+
+        // Merge results across addresses, summing value_change for same txid.
+        let mut merged: std::collections::HashMap<String, mainnet::models::TransactionHistoryItem> =
+            std::collections::HashMap::new();
+        for item in results.into_iter().filter_map(|r| r.ok()).flatten() {
+            let txid = item.hash.clone().unwrap_or_default();
+            merged
+                .entry(txid)
+                .and_modify(|existing| {
+                    // Sum BCH value_change across addresses
+                    existing.value_change = Some(
+                        existing.value_change.unwrap_or(0.0)
+                            + item.value_change.unwrap_or(0.0),
+                    );
+                    // Merge token_amount_changes by category
+                    if let Some(new_changes) = &item.token_amount_changes {
+                        let ec = existing
+                            .token_amount_changes
+                            .get_or_insert_with(Vec::new);
+                        for nc in new_changes {
+                            let cat = nc.category.as_deref().unwrap_or("");
+                            if let Some(found) = ec
+                                .iter_mut()
+                                .find(|c| c.category.as_deref().unwrap_or("") == cat)
+                            {
+                                found.amount = Some(
+                                    found.amount.unwrap_or(0.0) + nc.amount.unwrap_or(0.0),
+                                );
+                                found.nft_amount = Some(
+                                    found.nft_amount.unwrap_or(0.0)
+                                        + nc.nft_amount.unwrap_or(0.0),
+                                );
+                            } else {
+                                ec.push(nc.clone());
+                            }
+                        }
+                    }
+                })
+                .or_insert(item);
+        }
+        let mut all_items: Vec<_> = merged.into_values().collect();
+
+        // Sort by timestamp descending (most recent first).
+        // Unconfirmed transactions (no timestamp) sort to the top.
+        all_items.sort_by(|a, b| {
+            let ta = a.timestamp.unwrap_or(f64::MAX);
+            let tb = b.timestamp.unwrap_or(f64::MAX);
+            tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Paginate the merged results.
+        let start = (opts.page as usize - 1) * page_size;
+        let has_next = all_items.len() > start + page_size;
+        let display_items: Vec<_> = all_items
+            .into_iter()
+            .skip(start)
+            .take(page_size)
+            .collect();
 
         // Convert mainnet TransactionHistoryItem to our HistoryEntry format
         let history: Vec<crate::types::HistoryEntry> = display_items
@@ -290,7 +422,7 @@ impl BchWallet {
                 // value_change is in satoshis (we requested unit=sat)
                 // Convert to BCH for display compatibility, unless token_id is set
                 let amount = if opts.token_id.is_empty() {
-                    value_change.abs() / 1e8
+                    value_change.abs() / SATS_PER_BCH
                 } else {
                     // For token history, look at token_amount_changes
                     if let Some(changes) = &item.token_amount_changes {
@@ -342,7 +474,7 @@ impl BchWallet {
                     record_type: record_type.to_string(),
                     txid: item.hash.clone().unwrap_or_default(),
                     amount,
-                    tx_fee: item.fee.unwrap_or(0.0) / 1e8,
+                    tx_fee: item.fee.unwrap_or(0.0) / SATS_PER_BCH,
                     senders: serde_json::Value::Null,
                     recipients: serde_json::Value::Null,
                     date_created: String::new(),
@@ -373,20 +505,66 @@ impl BchWallet {
         })
     }
 
+    /// Get per-address token balances (for verbose output).
+    /// Returns Vec of (path, address, category -> amount).
+    pub async fn get_address_token_balances(
+        &self,
+    ) -> Result<Vec<(String, String, std::collections::HashMap<String, f64>)>> {
+        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
+            mainnet::apis::wallet_api::get_all_token_balances(
+                &self.api_config,
+                mainnet::models::GetAllTokenBalancesRequest {
+                    wallet_id: wid.clone(),
+                },
+            )
+        }).collect();
+
+        let results = futures::future::join_all(futures).await;
+        let mut out = Vec::new();
+        for (wid, result) in self.token_watch_ids.iter().zip(results) {
+            let balances = match result {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let parsed: std::collections::HashMap<String, f64> = balances
+                .into_iter()
+                .filter_map(|(cat, amt_str)| {
+                    let amt: f64 = amt_str.parse().ok()?;
+                    if amt > 0.0 { Some((cat, amt)) } else { None }
+                })
+                .collect();
+            if !parsed.is_empty() {
+                let path = self.watch_paths.get(wid).cloned().unwrap_or_default();
+                let addr = wid.splitn(3, ':').nth(2).unwrap_or(wid).to_string();
+                out.push((path, addr, parsed));
+            }
+        }
+        Ok(out)
+    }
+
     /// List all fungible CashToken balances, with BCMR metadata.
     pub async fn get_fungible_tokens(&self) -> Result<Vec<FungibleToken>> {
-        let balances = mainnet::apis::wallet_api::get_all_token_balances(
-            &self.api_config,
-            mainnet::models::GetAllTokenBalancesRequest {
-                wallet_id: self.watch_ids[0].clone(),
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("token balances request failed: {:?}", e))?;
+        // Query all token-aware addresses in parallel and merge by category.
+        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
+            mainnet::apis::wallet_api::get_all_token_balances(
+                &self.api_config,
+                mainnet::models::GetAllTokenBalancesRequest {
+                    wallet_id: wid.clone(),
+                },
+            )
+        }).collect();
+
+        let results = futures::future::join_all(futures).await;
+        let mut merged: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for result in results.into_iter().filter_map(|r| r.ok()) {
+            for (category, amount_str) in result {
+                let amount: f64 = amount_str.parse().unwrap_or(0.0);
+                *merged.entry(category).or_insert(0.0) += amount;
+            }
+        }
 
         let mut tokens = Vec::new();
-        for (category, amount_str) in balances {
-            let amount: f64 = amount_str.parse().unwrap_or(0.0);
+        for (category, amount) in merged {
             if amount <= 0.0 {
                 continue;
             }
@@ -424,19 +602,28 @@ impl BchWallet {
         }))
     }
 
-    /// Get NFT UTXOs, optionally filtered by category.
+    /// Get NFT UTXOs, optionally filtered by category (across all token addresses).
     pub async fn get_nft_utxos(&self, category: Option<&str>) -> Result<Vec<NftUtxo>> {
-        let req = mainnet::models::GetTokenUtxosRequest {
-            wallet_id: self.watch_ids[0].clone(),
-            category: category.map(|c| Some(c.to_string())),
-        };
+        let cat = category.map(|c| c.to_string());
+        let futures: Vec<_> = self.token_watch_ids.iter().map(|wid| {
+            mainnet::apis::wallet_api::get_token_utxos(
+                &self.api_config,
+                mainnet::models::GetTokenUtxosRequest {
+                    wallet_id: wid.clone(),
+                    category: cat.as_ref().map(|c| Some(c.clone())),
+                },
+            )
+        }).collect();
 
-        let utxos = mainnet::apis::wallet_api::get_token_utxos(&self.api_config, req)
-            .await
-            .map_err(|e| anyhow::anyhow!("NFT UTXO request failed: {:?}", e))?;
+        let results = futures::future::join_all(futures).await;
 
+        // Deduplicate by (txid, vout) since same UTXO won't appear at multiple addresses.
+        let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
         let mut nfts = Vec::new();
-        for u in utxos {
+        for u in results.into_iter().filter_map(|r| r.ok()).flatten() {
+            if !seen.insert((u.txid.clone(), u.vout as u32)) {
+                continue;
+            }
             let token = match &u.token {
                 Some(Some(t)) => t,
                 _ => continue,
@@ -490,7 +677,7 @@ impl BchWallet {
         };
 
         // Convert BCH to satoshis
-        let amount_sats = (amount * 1e8).round() as u64;
+        let amount_sats = (amount * SATS_PER_BCH).round() as u64;
         if amount_sats == 0 {
             return Ok(SendResult {
                 success: false,
@@ -524,20 +711,12 @@ impl BchWallet {
             &outputs,
             &change_addr,
             &self.hd_wallet,
-            1.2, // fee rate: 1.2 sats/byte
+            DEFAULT_FEE_RATE,
         ) {
             Ok(tx) => tx,
             Err(e) => {
                 let err_msg = e.to_string();
-                let lacking = if err_msg.contains("short by") {
-                    err_msg
-                        .split("short by ")
-                        .nth(1)
-                        .and_then(|s| s.split(' ').next())
-                        .and_then(|s| s.parse::<u64>().ok())
-                } else {
-                    None
-                };
+                let lacking = extract_lacking_sats(&err_msg);
                 return Ok(SendResult {
                     success: false,
                     txid: None,
@@ -681,7 +860,7 @@ impl BchWallet {
         let output_bch: u64 = outputs.iter().map(|o| o.value).sum();
         for utxo in &sorted_bch {
             let input_bch: u64 = all_inputs.iter().map(|i| i.value).sum();
-            if input_bch >= output_bch + 2000 {
+            if input_bch >= output_bch + FEE_RESERVE_SATS {
                 break;
             }
             all_inputs.push(utxo.clone());
@@ -693,20 +872,12 @@ impl BchWallet {
             &outputs,
             &bch_change_addr,
             &self.hd_wallet,
-            1.2,
+            DEFAULT_FEE_RATE,
         ) {
             Ok(tx) => tx,
             Err(e) => {
                 let err_msg = e.to_string();
-                let lacking = if err_msg.contains("short by") {
-                    err_msg
-                        .split("short by ")
-                        .nth(1)
-                        .and_then(|s| s.split(' ').next())
-                        .and_then(|s| s.parse::<u64>().ok())
-                } else {
-                    None
-                };
+                let lacking = extract_lacking_sats(&err_msg);
                 return Ok(SendResult {
                     success: false,
                     txid: None,
@@ -820,7 +991,7 @@ impl BchWallet {
         let output_bch: u64 = outputs.iter().map(|o| o.value).sum();
         for utxo in &sorted_bch {
             let input_bch: u64 = all_inputs.iter().map(|i| i.value).sum();
-            if input_bch >= output_bch + 2000 {
+            if input_bch >= output_bch + FEE_RESERVE_SATS {
                 break;
             }
             all_inputs.push(utxo.clone());
@@ -832,20 +1003,12 @@ impl BchWallet {
             &outputs,
             &bch_change_addr,
             &self.hd_wallet,
-            1.2,
+            DEFAULT_FEE_RATE,
         ) {
             Ok(tx) => tx,
             Err(e) => {
                 let err_msg = e.to_string();
-                let lacking = if err_msg.contains("short by") {
-                    err_msg
-                        .split("short by ")
-                        .nth(1)
-                        .and_then(|s| s.split(' ').next())
-                        .and_then(|s| s.parse::<u64>().ok())
-                } else {
-                    None
-                };
+                let lacking = extract_lacking_sats(&err_msg);
                 return Ok(SendResult {
                     success: false,
                     txid: None,

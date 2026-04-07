@@ -157,15 +157,23 @@ pub async fn run_send_all(
         .await
         .context("failed to broadcast transaction")?;
 
-    let txid = broadcast_result
-        .txid
-        .unwrap_or_else(|| built.txid.clone());
+    if broadcast_result.success {
+        let txid = broadcast_result
+            .txid
+            .unwrap_or_else(|| built.txid.clone());
 
-    println!("   {}\n", "Transaction sent successfully!".green());
-    println!("   txid: {}", txid);
-    let explorer = network::explorer_url(chipnet);
-    println!("   {}", format!("{}{}", explorer, txid).dimmed());
-    println!("   {}", format!("Sent: {} sats, Fee: {} sats", send_amount, built.fee).dimmed());
+        println!("   {}\n", "Transaction sent successfully!".green());
+        println!("   txid: {}", txid);
+        let explorer = network::explorer_url(chipnet);
+        println!("   {}", format!("{}{}", explorer, txid).dimmed());
+        println!("   {}", format!("Sent: {} sats, Fee: {} sats", send_amount, built.fee).dimmed());
+    } else {
+        let err_msg = broadcast_result.error.as_deref().unwrap_or("Unknown error");
+        println!(
+            "   {}",
+            format!("Transaction failed: {}", err_msg).red()
+        );
+    }
 
     println!();
     Ok(())

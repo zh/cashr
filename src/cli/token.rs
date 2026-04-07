@@ -1,29 +1,13 @@
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
+use crate::cli::utils::{format_token_amount, short_hex};
 use crate::network;
 use crate::wallet;
 use crate::wallet::bch::NftSendParams;
 
-/// Truncate a hex string for display.
-fn short_hex(hex: &str, len: usize) -> String {
-    if hex.len() <= len * 2 + 3 {
-        return hex.to_string();
-    }
-    format!("{}...{}", &hex[..len], &hex[hex.len() - len..])
-}
-
-/// Format a token amount with decimal scaling.
-fn format_token_amount(raw_amount: f64, decimals: u32) -> String {
-    if decimals == 0 {
-        return format!("{}", raw_amount as u64);
-    }
-    let scaled = raw_amount / 10f64.powi(decimals as i32);
-    format!("{:.prec$}", scaled, prec = decimals as usize)
-}
-
 /// List all CashTokens (fungible + NFTs) in the wallet.
-pub async fn list(wallet_name: Option<&str>, chipnet: bool) -> Result<()> {
+pub async fn list(wallet_name: Option<&str>, chipnet: bool, verbose: bool) -> Result<()> {
     let network_name = if chipnet { "chipnet" } else { "mainnet" };
 
     let w = wallet::load_wallet(wallet_name).context("failed to load wallet")?;
@@ -121,6 +105,30 @@ pub async fn list(wallet_name: Option<&str>, chipnet: bool) -> Result<()> {
         )
         .dimmed()
     );
+
+    if verbose {
+        let addr_balances = bch
+            .get_address_token_balances()
+            .await
+            .context("failed to fetch per-address token balances")?;
+        if !addr_balances.is_empty() {
+            println!("\n   {}\n", "Per-address breakdown:".dimmed());
+            for (path, addr, cats) in &addr_balances {
+                println!(
+                    "   {}  {}",
+                    format!("m/44'/145'/0'/{}", path).dimmed(),
+                    addr.dimmed()
+                );
+                for (cat, amount) in cats {
+                    println!(
+                        "      {} {}",
+                        *amount as u64,
+                        short_hex(cat, 8).dimmed()
+                    );
+                }
+            }
+        }
+    }
 
     println!();
     Ok(())

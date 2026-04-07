@@ -30,7 +30,7 @@ pub async fn run(
     raw_headers: &[String],
     body: Option<&str>,
     chipnet: bool,
-    _max_amount: Option<u64>,
+    max_amount: Option<u64>,
     change_address: Option<&str>,
     payer_index: Option<u32>,
     dry_run: bool,
@@ -62,6 +62,7 @@ pub async fn run(
             &payer_addr,
             change_address,
             confirmed,
+            max_amount,
         )
         .await;
     }
@@ -132,6 +133,18 @@ pub async fn run(
             .map(|s| s.to_string())
             .or_else(|| bch.get_address_set_at(0).ok().map(|a| a.change))
             .unwrap_or_default();
+
+        // Enforce max_amount safety limit
+        if let Some(max) = max_amount {
+            let requested: u64 = amount_sats.parse().unwrap_or(0);
+            if requested > max {
+                anyhow::bail!(
+                    "server requested {} sats but --max-amount is {} sats",
+                    requested,
+                    max
+                );
+            }
+        }
 
         if !confirmed {
             println!("   {}", "Payment Required".yellow());
@@ -425,6 +438,7 @@ async fn run_json(
     payer_addr: &str,
     change_address: Option<&str>,
     confirmed: bool,
+    max_amount: Option<u64>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let mut req_builder = client.request(
@@ -485,6 +499,22 @@ async fn run_json(
             .map(|s| s.to_string())
             .or_else(|| bch.get_address_set_at(0).ok().map(|a| a.change))
             .unwrap_or_default();
+
+        // Enforce max_amount safety limit
+        if let Some(max) = max_amount {
+            let requested: u64 = amount_sats.parse().unwrap_or(0);
+            if requested > max {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "success": false,
+                        "status": 402,
+                        "error": format!("server requested {} sats but --max-amount is {} sats", requested, max)
+                    }))?
+                );
+                return Ok(());
+            }
+        }
 
         if !confirmed {
             // In JSON mode without --confirmed, still prompt

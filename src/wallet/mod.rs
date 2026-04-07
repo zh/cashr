@@ -11,11 +11,20 @@ use keys::{compute_wallet_hash, HdWallet};
 use bch::BchWallet;
 
 /// Information about a wallet (returned from generate/import/load).
-#[derive(Debug)]
 pub struct WalletInfo {
     pub name: String,
     pub mnemonic: String,
     pub wallet_hash: String,
+}
+
+impl std::fmt::Debug for WalletInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletInfo")
+            .field("name", &self.name)
+            .field("mnemonic", &"[REDACTED]")
+            .field("wallet_hash", &self.wallet_hash)
+            .finish()
+    }
 }
 
 /// High-level Wallet struct that provides access to BCH wallets.

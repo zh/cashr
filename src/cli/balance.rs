@@ -1,28 +1,8 @@
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
+use crate::cli::utils::{bch_to_sats, format_sats};
 use crate::wallet;
-
-/// Convert BCH to satoshis.
-fn bch_to_sats(bch: f64) -> i64 {
-    (bch * 1e8).round() as i64
-}
-
-/// Format satoshis with thousands separators.
-fn format_sats(sats: i64) -> String {
-    let s = sats.abs().to_string();
-    let mut result = String::new();
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
-    }
-    if sats < 0 {
-        result.push('-');
-    }
-    result.chars().rev().collect()
-}
 
 /// Display wallet balance (BCH or token).
 pub async fn run(
@@ -30,6 +10,7 @@ pub async fn run(
     chipnet: bool,
     token_id: Option<&str>,
     sats_only: bool,
+    verbose: bool,
 ) -> Result<()> {
     let network = if chipnet { "chipnet" } else { "mainnet" };
 
@@ -132,6 +113,25 @@ pub async fn run(
                     "{}",
                     format!("               {} sats", format_sats(spendable_sats)).dimmed()
                 );
+            }
+        }
+
+        if verbose {
+            let addr_balances = bch
+                .get_address_balances()
+                .await
+                .context("failed to fetch address balances")?;
+            if !addr_balances.is_empty() {
+                println!("\n   {}\n", "Per-address breakdown:".dimmed());
+                for (path, addr, sats) in &addr_balances {
+                    let bch_val = sats / 1e8;
+                    println!(
+                        "   {}  {} BCH  {}",
+                        format!("m/44'/145'/0'/{}", path).dimmed(),
+                        bch_val,
+                        addr.dimmed()
+                    );
+                }
             }
         }
     }

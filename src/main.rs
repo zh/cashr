@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod cli;
+mod constants;
 mod crypto;
 mod network;
 mod storage;
@@ -44,6 +45,9 @@ enum Commands {
         /// Display amounts in satoshis only
         #[arg(long)]
         sats: bool,
+        /// Show per-address balance breakdown
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Send BCH to an address
     Send {
@@ -246,6 +250,9 @@ enum TokenCommand {
         /// Use chipnet (testnet)
         #[arg(long)]
         chipnet: bool,
+        /// Show per-address token breakdown
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Show info for a specific CashToken
     Info {
@@ -353,8 +360,9 @@ async fn run() -> Result<()> {
             chipnet,
             token,
             sats,
+            verbose,
         } => {
-            cli::balance::run(wallet_name, chipnet || auto_chipnet, token.as_deref(), sats).await?;
+            cli::balance::run(wallet_name, chipnet || auto_chipnet, token.as_deref(), sats, verbose).await?;
         }
         Commands::Send {
             address,
@@ -404,8 +412,8 @@ async fn run() -> Result<()> {
             .await?;
         }
         Commands::Token { command } => match command {
-            TokenCommand::List { chipnet } => {
-                cli::token::list(wallet_name, chipnet || auto_chipnet).await?;
+            TokenCommand::List { chipnet, verbose } => {
+                cli::token::list(wallet_name, chipnet || auto_chipnet, verbose).await?;
             }
             TokenCommand::Info { category, chipnet } => {
                 cli::token::info(wallet_name, &category, chipnet || auto_chipnet).await?;
